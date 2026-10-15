@@ -13,7 +13,7 @@ server refuses to start with neither.
 | Enabled by | `DOCMOST_MCP_BEARER_TOKEN` | `DOCMOST_MCP_ACCOUNT_AUTH=true` |
 | Identity | one shared Docmost credential | each user's own Docmost account |
 | Docmost permissions | whatever the shared account has | inherited per user |
-| Token lifetime | until rotated | short-lived, memory-only |
+| Token lifetime | until rotated | access: short-lived, memory-only; refresh: sealed, single-use, until the Docmost session expires |
 | Intended for | single user, automation, break-glass | shared and multi-user servers |
 
 Both may be enabled at once: the static token is checked first and is the
@@ -23,9 +23,56 @@ harmless** — anything holding it still acts as the shared account, so drop
 
 Account OAuth uses authorization code flow with PKCE (S256 required), exact
 registered redirect URIs, CSRF-protected login, per-account failed-login
-throttling, one-time authorization codes, and opaque tokens stored only as
-SHA-256 hashes. Grants live in memory, so a restart requires users to sign in
-again — deliberately.
+throttling, one-time authorization codes, and opaque access tokens stored only
+as SHA-256 hashes, in memory.
+
+### Refresh tokens and what is at rest
+
+Each grant carries the user's Docmost session token. The server never writes
+that token to its own disk:
+
+- **Access tokens** are opaque, live in memory as SHA-256 hashes, and last at
+  most an hour. A restart forgets them; the client gets a 401 and refreshes.
+- **Refresh tokens** are not stored by the server at all. Each one is an
+  AES-256-GCM sealed blob (`dmr1.…`) holding the client it was issued to (as a
+  hash), the scope, the Docmost session, an expiry (the Docmost session's) and
+  a rotation id. The client stores it; without the key it is opaque and cannot
+  be altered. Because nothing server-side is needed to redeem it, it survives
+  a restart.
+- **The key** is 32 random bytes in `~/.docmost-local-mcp/refresh-token.key`
+  (override with `DOCMOST_MCP_REFRESH_KEY_FILE`), created on first start with
+  mode 0600 in a 0700 directory. A file of the wrong length stops startup
+  rather than being replaced. **This file is the secret to protect**: anyone
+  who has it *and* a client's stored refresh token can read the Docmost
+  session inside. Deleting it (and restarting) invalidates every outstanding
+  refresh token; users then sign in again. Tokens are also bound to
+  `DOCMOST_MCP_PUBLIC_URL` and `DOCMOST_BASE_URL`, so changing either has the
+  same effect.
+- **Single use.** Every refresh rotates the token. Rotation state per
+  authorization (no credentials, just a counter) is kept in memory; presenting
+  a token that was already redeemed refuses it and revokes every token
+  descended from the same authorization, so a stolen copy and the legitimate
+  client cannot both keep going.
+- **Revalidation.** Before issuing anything, a refresh asks Docmost
+  (`/api/users/me`) whether the session is still valid. If Docmost answers 401
+  or 403 (signed out, revoked, expired) the refresh fails with
+  `invalid_grant`, so signing out of Docmost also cuts off agents at their
+  next refresh. If Docmost cannot be reached the refresh proceeds: the session
+  is still checked by Docmost on every tool call.
+
+Residual risks, stated plainly:
+
+- Rotation state is lost on restart. After a restart, each authorization's
+  first refresh is accepted whichever of its unexpired tokens is presented,
+  including one already redeemed before the restart. A thief holding a copied
+  refresh token therefore gets one redemption per restart; when the
+  legitimate client then refreshes, the reuse is detected and both lose
+  access. A revocation triggered by reuse is likewise forgotten on restart.
+- An access token outlives a Docmost sign-out by up to an hour in this
+  server's memory, though Docmost itself rejects the session on every call.
+- Refresh tokens are bearer credentials until the Docmost session expires (or
+  the key is deleted). Clients should store them as they would any OAuth
+  refresh token.
 
 ## Supported boundary
 
@@ -48,8 +95,9 @@ user before sending `confirm: true`.
 - Email/password authentication does not persist the password when supplied via
   environment variables.
 - Account OAuth sends the password only to the MCP login handler and immediately
-  exchanges it with Docmost; the password is never stored. Account access grants
-  are memory-only and are invalidated by a process restart.
+  exchanges it with Docmost; the password is never stored. Access grants are
+  memory-only; refresh tokens are sealed and held by the client (see above).
+  Back up or mount `refresh-token.key` with the same care as other secrets.
 - OS-keychain persistence is preferred for interactive stdio mode. File fallback
   requires `DOCMOST_ALLOW_FILE_CREDENTIALS=true`.
 

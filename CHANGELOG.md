@@ -17,6 +17,18 @@ All notable changes are documented here. The format loosely follows
   two different products. **Breaking** for anyone who pinned the old names.
 
 ### Fixed
+- **A server restart no longer signs every account-auth user out.** Refresh
+  tokens lived only in memory, so after a restart or redeploy every client's
+  refresh failed with `invalid_grant` and each user had to authorize again by
+  hand. Refresh tokens are now sealed with AES-256-GCM and held by the client:
+  nothing is stored for them server-side, and the Docmost session they carry
+  is never written to the server's disk. The key is created on first start in
+  `~/.docmost-local-mcp/refresh-token.key` (0600; `DOCMOST_MCP_REFRESH_KEY_FILE`
+  overrides the path); deleting it invalidates every refresh token. Refresh
+  tokens stay single-use, and replaying a spent one now revokes the whole
+  rotation. Each refresh first checks the session with Docmost, so signing out
+  of Docmost also ends the MCP connection at its next refresh. Access tokens
+  remain in memory; after a restart clients get a 401 and refresh.
 - **Pagination metadata is now returned, making the `cursor` parameter usable.**
   Every cursor-based list tool accepted a `cursor`, but responses were folded into
   a bare `Vec` that discarded the rest — so nothing ever told the caller what the
