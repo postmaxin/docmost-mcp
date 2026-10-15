@@ -53,7 +53,8 @@ impl DocmostMcpServer {
             client,
             tool_router: Self::tool_router()
                 + Self::page_write_tool_router()
-                + Self::write_tool_router(),
+                + Self::write_tool_router()
+                + Self::attachment_tool_router(),
             writes_enabled: matches!(
                 std::env::var("DOCMOST_MCP_ENABLE_WRITES").ok().as_deref(),
                 Some("1") | Some("true")
