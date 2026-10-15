@@ -861,3 +861,222 @@ fn mention_label_with_bracket_falls_back_to_plain_at() {
         "must not emit broken mention markdown: {md}"
     );
 }
+
+// --- embeds and other Docmost block nodes ---
+
+const YOUTUBE: &str = "https://www.youtube.com/watch?v=Op-LKk-i4zQ";
+
+/// An `embed` node as Docmost 0.96 stores one made from a bare YouTube URL.
+fn youtube_embed() -> Value {
+    json!({
+        "type": "embed",
+        "attrs": {
+            "src": YOUTUBE,
+            "provider": "youtube",
+            "align": "center",
+            "width": "640",
+            "height": "480",
+            "dir": "auto"
+        }
+    })
+}
+
+fn paragraph(text: &str) -> Value {
+    json!({ "type": "paragraph", "content": [{ "type": "text", "text": text }] })
+}
+
+#[test]
+fn renders_top_level_embed_as_bare_link() {
+    let markdown = prosemirror_to_markdown(&json!({
+        "type": "doc",
+        "content": [paragraph("Intro"), youtube_embed(), paragraph("After")]
+    }));
+    assert_eq!(
+        markdown,
+        format!("Intro\n\n[{YOUTUBE}]({YOUTUBE})\n\nAfter")
+    );
+}
+
+#[test]
+fn renders_embed_inside_list_item() {
+    // The shape Docmost's import produced for `- Watch the talk: <YouTube URL>`.
+    let markdown = prosemirror_to_markdown(&json!({
+        "type": "doc",
+        "content": [{
+            "type": "bulletList",
+            "content": [
+                {
+                    "type": "listItem",
+                    "content": [paragraph("Watch the talk:"), youtube_embed()]
+                },
+                { "type": "listItem", "content": [paragraph("Next item")] }
+            ]
+        }]
+    }));
+    assert_eq!(
+        markdown,
+        format!("- Watch the talk:\n\n  [{YOUTUBE}]({YOUTUBE})\n- Next item")
+    );
+}
+
+#[test]
+fn renders_extra_list_item_blocks_indented_to_the_marker() {
+    let markdown = prosemirror_to_markdown(&json!({
+        "type": "doc",
+        "content": [{
+            "type": "orderedList",
+            "attrs": { "start": 9 },
+            "content": [
+                { "type": "listItem", "content": [paragraph("Nine")] },
+                {
+                    "type": "listItem",
+                    "content": [
+                        paragraph("Ten"),
+                        paragraph("Second paragraph"),
+                        {
+                            "type": "image",
+                            "attrs": { "src": "/api/files/a/b.png", "alt": "shot" }
+                        }
+                    ]
+                }
+            ]
+        }]
+    }));
+    assert_eq!(
+        markdown,
+        "9. Nine\n10. Ten\n\n    Second paragraph\n\n    ![shot](/api/files/a/b.png)"
+    );
+}
+
+#[test]
+fn renders_list_item_that_starts_with_an_embed() {
+    let markdown = prosemirror_to_markdown(&json!({
+        "type": "doc",
+        "content": [{
+            "type": "taskList",
+            "content": [{
+                "type": "taskItem",
+                "attrs": { "checked": true },
+                "content": [youtube_embed(), paragraph("watched")]
+            }]
+        }]
+    }));
+    assert_eq!(
+        markdown,
+        format!("- [x] [{YOUTUBE}]({YOUTUBE})\n\n  watched")
+    );
+}
+
+#[test]
+fn markdown_to_prosemirror_bare_provider_link_is_an_embed() {
+    for source in [format!("[{YOUTUBE}]({YOUTUBE})"), format!("<{YOUTUBE}>")] {
+        let doc = markdown_to_prosemirror(&source);
+        let children = doc_children(&doc);
+        assert_eq!(children.len(), 1, "{source}: {doc}");
+        assert_eq!(children[0], {
+            let mut embed = youtube_embed();
+            embed["attrs"].as_object_mut().unwrap().remove("dir");
+            embed
+        });
+    }
+}
+
+#[test]
+fn markdown_to_prosemirror_named_or_unknown_links_stay_links() {
+    for source in [
+        format!("[the talk]({YOUTUBE})"),
+        "<https://example.com/watch?v=x>".to_string(),
+    ] {
+        let doc = markdown_to_prosemirror(&source);
+        assert!(find_node(&doc, "embed").is_none(), "{source}: {doc}");
+        assert_eq!(node_type(&doc_children(&doc)[0]), Some("paragraph"));
+    }
+}
+
+#[test]
+fn markdown_to_prosemirror_embed_splits_its_paragraph() {
+    let doc = markdown_to_prosemirror(&format!("before\n<{YOUTUBE}>\nafter"));
+    let types: Vec<_> = doc_children(&doc).iter().map(node_type).collect();
+    assert_eq!(
+        types,
+        [Some("paragraph"), Some("embed"), Some("paragraph")],
+        "{doc}"
+    );
+    assert_eq!(
+        prosemirror_to_markdown(&doc),
+        format!("before\n\n[{YOUTUBE}]({YOUTUBE})\n\nafter")
+    );
+}
+
+#[test]
+fn embed_in_list_item_round_trips_through_markdown() {
+    let original = json!({
+        "type": "doc",
+        "content": [{
+            "type": "bulletList",
+            "content": [
+                {
+                    "type": "listItem",
+                    "content": [paragraph("Watch the talk:"), youtube_embed()]
+                },
+                { "type": "listItem", "content": [paragraph("Next item")] }
+            ]
+        }]
+    });
+    let back = markdown_to_prosemirror(&prosemirror_to_markdown(&original));
+
+    let list = &doc_children(&back)[0];
+    assert_eq!(node_type(list), Some("bulletList"));
+    let items = list["content"].as_array().expect("list items");
+    assert_eq!(items.len(), 2, "{back}");
+    let first: Vec<_> = items[0]["content"]
+        .as_array()
+        .expect("item content")
+        .iter()
+        .map(node_type)
+        .collect();
+    assert_eq!(first, [Some("paragraph"), Some("embed")], "{back}");
+    assert_eq!(items[0]["content"][1]["attrs"]["src"], YOUTUBE);
+    assert_eq!(items[0]["content"][1]["attrs"]["provider"], "youtube");
+    assert_eq!(
+        prosemirror_to_markdown(&back),
+        prosemirror_to_markdown(&original)
+    );
+}
+
+#[test]
+fn renders_media_diagram_math_and_callout_nodes() {
+    let markdown = prosemirror_to_markdown(&json!({
+        "type": "doc",
+        "content": [
+            { "type": "drawio", "attrs": { "src": "/api/files/d/flow.drawio.svg", "title": "Flow" } },
+            { "type": "excalidraw", "attrs": { "src": "/api/files/e/sketch.excalidraw.svg" } },
+            { "type": "video", "attrs": { "src": "/api/files/v/demo.mp4" } },
+            { "type": "attachment", "attrs": { "url": "/api/files/f/report.pdf", "name": "report.pdf" } },
+            { "type": "mathBlock", "attrs": { "text": "E = mc^2" } },
+            {
+                "type": "paragraph",
+                "content": [
+                    { "type": "text", "text": "where " },
+                    { "type": "mathInline", "attrs": { "text": "c" } },
+                    { "type": "text", "text": " is light speed" }
+                ]
+            },
+            { "type": "callout", "attrs": { "type": "warning" }, "content": [paragraph("Careful")] }
+        ]
+    }));
+    for needle in [
+        "![Flow](/api/files/d/flow.drawio.svg)",
+        "![diagram](/api/files/e/sketch.excalidraw.svg)",
+        "[video](/api/files/v/demo.mp4)",
+        "[report.pdf](/api/files/f/report.pdf)",
+        "$$\nE = mc^2\n$$",
+        "where $c$ is light speed",
+        ":::warning\nCareful\n:::",
+    ] {
+        assert!(
+            markdown.contains(needle),
+            "missing {needle:?} in:\n{markdown}"
+        );
+    }
+}

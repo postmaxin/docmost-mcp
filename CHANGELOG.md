@@ -33,6 +33,17 @@ All notable changes are documented here. The format loosely follows
   was cleared by hand. The signing key is persisted to
   `~/.docmost-local-mcp/client-id.key` (0600, created on first start;
   `DOCMOST_MCP_CLIENT_ID_KEY_FILE` overrides the path).
+- **`docmost_get_page` no longer drops embeds and other Docmost blocks.** An
+  `embed` (YouTube, Vimeo, Loom, ...) inside a list item vanished from the
+  Markdown, as did every block in a list item after its first paragraph, so an
+  agent reading a page concluded the link was gone. A top-level embed came back
+  as `[Embedded content](url)`, which Docmost re-imports as a plain link. Embeds
+  now render as a bare link, `[url](url)`, which both Docmost's import
+  (`docmost_create_page`) and `docmost_update_page` turn back into an embed for
+  the providers Docmost embeds. Extra blocks in list items are kept, indented
+  under the item. Draw.io and Excalidraw diagrams render as images; videos,
+  audio, PDFs and file attachments as links; math as `$...$`/`$$...$$`; and
+  callouts as Docmost's `:::type` fences.
 - **Pagination metadata is now returned, making the `cursor` parameter usable.**
   Every cursor-based list tool accepted a `cursor`, but responses were folded into
   a bare `Vec` that discarded the rest — so nothing ever told the caller what the

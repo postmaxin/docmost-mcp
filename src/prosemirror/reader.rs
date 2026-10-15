@@ -119,13 +119,52 @@ fn convert_nodes(nodes: &[Value], indent: usize) -> String {
                 }
             }
             Some("embed") => {
-                let src = node
-                    .get("attrs")
-                    .and_then(|attrs| attrs.get("src"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                // A bare link (text == URL): Docmost's import turns that back into an
+                // embed for a known provider, and so does `markdown_to_prosemirror`.
+                let src = attr_str(node, "src");
                 if !src.is_empty() {
-                    output.push(format!("[Embedded content]({src})"));
+                    output.push(format!("[{src}]({src})"));
+                    output.push(String::new());
+                }
+            }
+            Some("drawio") | Some("excalidraw") => {
+                // Diagrams are stored as an image attachment (SVG) of the drawing.
+                let src = attr_str(node, "src");
+                if !src.is_empty() {
+                    let title = first_non_empty(&[attr_str(node, "title"), attr_str(node, "alt")])
+                        .unwrap_or("diagram");
+                    output.push(format!("![{title}]({src})"));
+                    output.push(String::new());
+                }
+            }
+            Some("video") | Some("audio") | Some("pdf") | Some("attachment") => {
+                // Uploaded media and files: a link to the attachment, as Docmost's own
+                // Markdown export writes a video.
+                let src = first_non_empty(&[attr_str(node, "src"), attr_str(node, "url")]);
+                if let Some(src) = src {
+                    let fallback = node_type(node).unwrap_or("file");
+                    let name = first_non_empty(&[attr_str(node, "name"), attr_str(node, "alt")])
+                        .unwrap_or(fallback);
+                    output.push(format!("[{name}]({src})"));
+                    output.push(String::new());
+                }
+            }
+            Some("mathBlock") => {
+                let text = attr_str(node, "text");
+                if !text.is_empty() {
+                    output.push(format!("$$\n{text}\n$$"));
+                    output.push(String::new());
+                }
+            }
+            Some("callout") => {
+                // Docmost's Markdown import and export both use `:::type` fences.
+                let inner = convert_nodes(children(node), 0);
+                if !inner.is_empty() {
+                    let callout_type = match attr_str(node, "type") {
+                        "" => "info",
+                        callout_type => callout_type,
+                    };
+                    output.push(format!(":::{callout_type}\n{inner}\n:::"));
                     output.push(String::new());
                 }
             }
@@ -195,6 +234,12 @@ fn extract_text(content: &[Value]) -> String {
                     parts.push(format!("[{label}]({entity_type}:{entity_id})"));
                 }
             }
+            Some("mathInline") => {
+                let text = attr_str(item, "text");
+                if !text.is_empty() {
+                    parts.push(format!("${text}$"));
+                }
+            }
             Some("hardBreak") => parts.push("\n".to_string()),
             _ if !children(item).is_empty() => parts.push(extract_text(children(item))),
             _ => {}
@@ -206,24 +251,10 @@ fn extract_text(content: &[Value]) -> String {
 
 fn convert_list(items: &[Value], ordered: bool, indent: usize, start: u64) -> String {
     let mut output = Vec::new();
-    let prefix = " ".repeat(indent);
 
     for (index, item) in items.iter().enumerate() {
         if node_type(item) != Some("listItem") {
             continue;
-        }
-
-        let mut first_paragraph = String::new();
-        let mut nested_lists = Vec::new();
-
-        for child in children(item) {
-            match node_type(child) {
-                Some("paragraph") if first_paragraph.is_empty() => {
-                    first_paragraph = extract_text(children(child));
-                }
-                Some("bulletList") | Some("orderedList") => nested_lists.push(child.clone()),
-                _ => {}
-            }
         }
 
         let marker = if ordered {
@@ -231,11 +262,7 @@ fn convert_list(items: &[Value], ordered: bool, indent: usize, start: u64) -> St
         } else {
             "- ".to_string()
         };
-        output.push(format!("{prefix}{marker}{first_paragraph}"));
-
-        for nested_list in nested_lists {
-            output.push(convert_nodes(&[nested_list], indent + 2));
-        }
+        output.push(convert_list_item(item, &marker, marker.len(), indent));
     }
 
     output.join("\n")
@@ -243,26 +270,10 @@ fn convert_list(items: &[Value], ordered: bool, indent: usize, start: u64) -> St
 
 fn convert_task_list(items: &[Value], indent: usize) -> String {
     let mut output = Vec::new();
-    let prefix = " ".repeat(indent);
 
     for item in items {
         if node_type(item) != Some("taskItem") {
             continue;
-        }
-
-        let mut first_paragraph = String::new();
-        let mut nested_lists = Vec::new();
-
-        for child in children(item) {
-            match node_type(child) {
-                Some("paragraph") if first_paragraph.is_empty() => {
-                    first_paragraph = extract_text(children(child));
-                }
-                Some("bulletList") | Some("orderedList") | Some("taskList") => {
-                    nested_lists.push(child.clone())
-                }
-                _ => {}
-            }
         }
 
         let checked = item
@@ -271,14 +282,62 @@ fn convert_task_list(items: &[Value], indent: usize) -> String {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let marker = if checked { "- [x] " } else { "- [ ] " };
-        output.push(format!("{prefix}{marker}{first_paragraph}"));
-
-        for nested_list in nested_lists {
-            output.push(convert_nodes(&[nested_list], indent + 2));
-        }
+        // Continuation lines align with the text after `- `, not after the checkbox.
+        output.push(convert_list_item(item, marker, 2, indent));
     }
 
     output.join("\n")
+}
+
+/// Render one list or task item. The first paragraph goes on the marker line and nested
+/// lists follow directly. Any other block child (an embed, image, further paragraph, code
+/// block, ...) is set off by a blank line and indented to `continuation` columns past the
+/// marker, so it stays inside the item instead of being dropped.
+fn convert_list_item(item: &Value, marker: &str, continuation: usize, indent: usize) -> String {
+    let prefix = " ".repeat(indent);
+    let block_prefix = " ".repeat(indent + continuation);
+    let mut lines = vec![format!("{prefix}{marker}")];
+    let mut has_first_paragraph = false;
+
+    for child in children(item) {
+        match node_type(child) {
+            Some("paragraph") if !has_first_paragraph => {
+                let text = extract_text(children(child));
+                if !text.is_empty() {
+                    has_first_paragraph = true;
+                    lines[0].push_str(&text);
+                }
+            }
+            Some("bulletList") | Some("orderedList") | Some("taskList") => {
+                lines.push(convert_nodes(std::slice::from_ref(child), indent + 2));
+            }
+            _ => {
+                let block = convert_nodes(std::slice::from_ref(child), 0);
+                if block.is_empty() {
+                    continue;
+                }
+                // A block in an item that has no leading paragraph starts on the marker
+                // line itself: Markdown does not allow a list item to open with a blank
+                // line followed by content.
+                let first_in_item = !has_first_paragraph && lines.len() == 1;
+                has_first_paragraph = true;
+                for (index, line) in block.lines().enumerate() {
+                    if index == 0 && first_in_item {
+                        lines[0].push_str(line);
+                    } else if index == 0 {
+                        lines.push(String::new());
+                        lines.push(format!("{block_prefix}{line}"));
+                    } else if line.is_empty() {
+                        lines.push(String::new());
+                    } else {
+                        lines.push(format!("{block_prefix}{line}"));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn convert_table(table_node: &Value) -> String {
@@ -328,6 +387,17 @@ fn convert_table(table_node: &Value) -> String {
     }
 
     lines.join("\n")
+}
+
+fn attr_str<'a>(node: &'a Value, key: &str) -> &'a str {
+    node.get("attrs")
+        .and_then(|attrs| attrs.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn first_non_empty<'a>(values: &[&'a str]) -> Option<&'a str> {
+    values.iter().copied().find(|value| !value.is_empty())
 }
 
 fn node_type(node: &Value) -> Option<&str> {
