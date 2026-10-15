@@ -71,7 +71,9 @@ export DOCMOST_MCP_BEARER_TOKEN="$(openssl rand -hex 32)" # break-glass only
 An OAuth-capable MCP client pointed at `https://mcp.example.com/mcp` discovers the
 login page automatically. Authorization uses code flow with PKCE and dynamic
 client registration. Access and refresh grants are held in memory, so a server
-restart intentionally requires users to sign in again.
+restart intentionally requires users to sign in again. Signing out of Docmost
+does the same: once Docmost rejects the session behind a grant, `/mcp` answers
+401 and the client re-runs the login.
 
 Verify:
 

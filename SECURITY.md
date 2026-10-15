@@ -37,6 +37,12 @@ restarts, because clients cache their `client_id` and do not re-register on
 their own. Deleting the file invalidates every issued `client_id`; affected
 clients must clear their stored authentication and connect again.
 
+Each grant carries the Docmost session captured at consent, and lives no longer
+than that session. Once Docmost rejects it (the user signed out, the session was
+revoked, or it expired), the server drops every access token, refresh token, and
+unredeemed code carrying it, and `/mcp` answers 401 with the OAuth challenge so
+the client signs in again. A refresh also checks the session with Docmost first.
+
 ## Supported boundary
 
 The default configuration is for a single machine: loopback HTTP, exact Host and
