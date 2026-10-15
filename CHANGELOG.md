@@ -17,6 +17,16 @@ All notable changes are documented here. The format loosely follows
   two different products. **Breaking** for anyone who pinned the old names.
 
 ### Fixed
+- **Anonymous client registration can no longer lock out real clients.**
+  `/oauth/register` is unauthenticated (MCP clients register before anyone
+  signs in), and registrations were kept in memory up to a cap of 1,024 with no
+  expiry or throttling. Anyone who could reach the endpoint could fill the
+  registry, after which every new registration failed with 503 until a restart
+  (which also signs everyone out). Registrations are now stateless: the
+  `client_id` is the registration — redirect URIs and name, signed with
+  HMAC-SHA256 under a per-process key — and is verified at `/oauth/authorize`.
+  Nothing is stored for a client until someone authorizes it. Registration
+  metadata is capped at 2 KiB in total so the `client_id` stays URL-sized.
 - **Pagination metadata is now returned, making the `cursor` parameter usable.**
   Every cursor-based list tool accepted a `cursor`, but responses were folded into
   a bare `Vec` that discarded the rest — so nothing ever told the caller what the

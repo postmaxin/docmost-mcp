@@ -27,6 +27,13 @@ throttling, one-time authorization codes, and opaque tokens stored only as
 SHA-256 hashes. Grants live in memory, so a restart requires users to sign in
 again — deliberately.
 
+Dynamic client registration is open (as MCP clients expect) but stores
+nothing: the issued `client_id` carries the client's redirect URIs and name,
+signed with HMAC-SHA256 under a key generated at startup, and is verified at
+authorization. Anonymous registrations therefore cannot exhaust memory or lock
+out real clients. A restart rotates the key, so clients re-register — as they
+already must, since grants do not survive a restart.
+
 ## Supported boundary
 
 The default configuration is for a single machine: loopback HTTP, exact Host and
