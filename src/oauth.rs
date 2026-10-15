@@ -220,6 +220,14 @@ impl OAuthState {
                 "/.well-known/oauth-protected-resource",
                 get(protected_resource_metadata),
             )
+            // RFC 9728 section 3.1: the metadata for resource `{public_url}/mcp`
+            // lives at the well-known path plus the resource's path. Clients
+            // that build that URL instead of following the 401's
+            // `resource_metadata` would otherwise get a 404.
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(protected_resource_metadata),
+            )
             .route(
                 "/.well-known/oauth-authorization-server",
                 get(authorization_server_metadata),
@@ -1329,6 +1337,36 @@ mod tests {
         assert!(valid_redirect_uri("http://127.0.0.1:43210/callback"));
         assert!(!valid_redirect_uri("http://client.example/callback"));
         assert!(!valid_redirect_uri("javascript:alert(1)"));
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_is_served_at_the_rfc_9728_path_too() -> anyhow::Result<()>
+    {
+        use tower::ServiceExt as _;
+
+        let router = OAuthState::new(OAuthConfig {
+            public_url: "https://mcp.example.com".into(),
+            docmost_base_url: "http://docmost:3000".into(),
+            brand: DEFAULT_BRAND.into(),
+            browser_url: None,
+        })?
+        .routes();
+        let mut documents = Vec::new();
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(axum::http::Request::get(path).body(axum::body::Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1_024).await?;
+            documents.push(serde_json::from_slice::<serde_json::Value>(&body)?);
+        }
+        assert_eq!(documents[0], documents[1]);
+        assert_eq!(documents[0]["resource"], "https://mcp.example.com/mcp");
+        Ok(())
     }
 
     #[test]

@@ -17,6 +17,13 @@ All notable changes are documented here. The format loosely follows
   two different products. **Breaking** for anyone who pinned the old names.
 
 ### Fixed
+- **Protected-resource metadata is also served at its RFC 9728 path.** The
+  metadata for the `/mcp` resource belongs at
+  `/.well-known/oauth-protected-resource/mcp` (the well-known path plus the
+  resource's path), but only the root `/.well-known/oauth-protected-resource`
+  was served. Clients that follow the 401's `resource_metadata` were fine;
+  clients that construct the RFC 9728 URL themselves got a 404. Both paths now
+  serve the same document.
 - **Pagination metadata is now returned, making the `cursor` parameter usable.**
   Every cursor-based list tool accepted a `cursor`, but responses were folded into
   a bare `Vec` that discarded the rest — so nothing ever told the caller what the
