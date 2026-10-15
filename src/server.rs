@@ -3,7 +3,7 @@ use std::future::Future;
 use rmcp::{
     ServerHandler,
     handler::server::router::tool::ToolRouter,
-    model::{ErrorData, Implementation, ServerCapabilities, ServerInfo},
+    model::{ErrorData, Implementation, ServerCapabilities, ServerConfig},
     tool_handler,
 };
 
@@ -23,8 +23,8 @@ pub struct DocmostMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DocmostMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("docmost-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("Docmost MCP")
