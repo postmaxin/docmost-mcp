@@ -29,10 +29,13 @@ again — deliberately.
 
 Dynamic client registration is open (as MCP clients expect) but stores
 nothing: the issued `client_id` carries the client's redirect URIs and name,
-signed with HMAC-SHA256 under a key generated at startup, and is verified at
-authorization. Anonymous registrations therefore cannot exhaust memory or lock
-out real clients. A restart rotates the key, so clients re-register — as they
-already must, since grants do not survive a restart.
+signed with HMAC-SHA256, and is verified at authorization. Anonymous
+registrations therefore cannot exhaust memory or lock out real clients. The
+signing key is created on first start in `~/.docmost-local-mcp/client-id.key`
+(mode 0600; override with `DOCMOST_MCP_CLIENT_ID_KEY_FILE`) and survives
+restarts, because clients cache their `client_id` and do not re-register on
+their own. Deleting the file invalidates every issued `client_id`; affected
+clients must clear their stored authentication and connect again.
 
 ## Supported boundary
 

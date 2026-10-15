@@ -24,9 +24,15 @@ All notable changes are documented here. The format loosely follows
   registry, after which every new registration failed with 503 until a restart
   (which also signs everyone out). Registrations are now stateless: the
   `client_id` is the registration — redirect URIs and name, signed with
-  HMAC-SHA256 under a per-process key — and is verified at `/oauth/authorize`.
-  Nothing is stored for a client until someone authorizes it. Registration
-  metadata is capped at 2 KiB in total so the `client_id` stays URL-sized.
+  HMAC-SHA256 — and is verified at `/oauth/authorize`. Nothing is stored for a
+  client until someone authorizes it. Registration metadata is capped at 2 KiB
+  in total so the `client_id` stays URL-sized.
+- **Client IDs now survive restarts.** Previously a restart forgot every
+  registration, and clients (which cache their `client_id` and go straight to
+  `/oauth/authorize`) hit `invalid_client` until their stored authentication
+  was cleared by hand. The signing key is persisted to
+  `~/.docmost-local-mcp/client-id.key` (0600, created on first start;
+  `DOCMOST_MCP_CLIENT_ID_KEY_FILE` overrides the path).
 - **Pagination metadata is now returned, making the `cursor` parameter usable.**
   Every cursor-based list tool accepted a `cursor`, but responses were folded into
   a bare `Vec` that discarded the rest — so nothing ever told the caller what the
