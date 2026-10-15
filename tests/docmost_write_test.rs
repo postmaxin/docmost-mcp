@@ -34,6 +34,11 @@ struct CapturedState {
     create_attempts: Arc<AtomicUsize>,
     update_attempts: Arc<AtomicUsize>,
     import_attempts: Arc<AtomicUsize>,
+    upload_attempts: Arc<AtomicUsize>,
+    /// Raw multipart bodies sent to the attachment upload endpoint (may be binary).
+    upload_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// When true, the upload route wraps its reply in a `{ data }` envelope.
+    envelope_upload: Arc<AtomicBool>,
     /// How many times the mock `/api/auth/login` endpoint was called.
     login_hits: Arc<AtomicUsize>,
 }
@@ -64,6 +69,8 @@ async fn spawn(temp: &TempDir) -> Result<(DocmostClient, CapturedState, String)>
         .route("/api/pages/create", post(create_route))
         .route("/api/pages/update", post(update_route))
         .route("/api/pages/import", post(import_route))
+        .route("/api/files/upload", post(upload_route))
+        .route("/api/pages/info", post(page_info_route))
         .route("/api/auth/login", post(login_route))
         .with_state(state.clone());
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -188,6 +195,67 @@ async fn import_route(
             "status": 200
         })),
     )
+}
+
+/// Mock attachment upload. Like Docmost 0.96, it replies with the bare attachment (no
+/// `{ data }` envelope) unless `envelope_upload` is set.
+async fn upload_route(
+    State(state): State<CapturedState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    if let Some(status) = injected_status(&state, &state.upload_attempts) {
+        return (status, Json(json!({ "message": "injected failure" })));
+    }
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("multipart/form-data"),
+        "upload must be multipart, got: {content_type}"
+    );
+    state.upload_bodies.lock().unwrap().push(body.to_vec());
+    let attachment = json!({
+        "id": "0199aaaa-0000-7000-8000-000000000001",
+        "fileName": "diagram.png",
+        "fileSize": 6,
+        "fileExt": ".png",
+        "mimeType": "image/png",
+        "type": "file",
+        "pageId": "page-1",
+        "spaceId": "space-1",
+        "url": "http://docs.example.com/api/files/0199aaaa-0000-7000-8000-000000000001/diagram.png"
+    });
+    if state.envelope_upload.load(Ordering::SeqCst) {
+        return (
+            StatusCode::OK,
+            Json(json!({ "data": attachment, "success": true, "status": 200 })),
+        );
+    }
+    (StatusCode::OK, Json(attachment))
+}
+
+/// Mock page lookup used to resolve a slug ID to the page UUID.
+async fn page_info_route(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    if body["pageId"] == json!("slug-1") {
+        return (
+            StatusCode::OK,
+            Json(json!({ "data": { "id": PAGE_UUID, "slugId": "slug-1" }, "success": true })),
+        );
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "message": "Page not found" })),
+    )
+}
+
+const PAGE_UUID: &str = "0199bbbb-0000-7000-8000-000000000002";
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Mock Docmost login: returns the auth token via a Set-Cookie header, matching the real
@@ -520,5 +588,116 @@ async fn update_page_with_no_changes_sends_only_page_id() -> Result<()> {
     assert_eq!(body["pageId"], json!("page-9"));
     assert!(body.get("title").is_none());
     assert!(body.get("content").is_none());
+    Ok(())
+}
+
+/// Bytes that are not valid UTF-8, so the test proves the file travels as raw binary.
+const PNG_ISH: &[u8] = &[0x89, b'P', b'N', b'G', 0x00, 0xff];
+
+#[tokio::test]
+async fn upload_attachment_sends_page_id_then_binary_file_part() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+
+    let attachment = client
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await?;
+    assert_eq!(attachment.id, "0199aaaa-0000-7000-8000-000000000001");
+    assert_eq!(attachment.file_name.as_deref(), Some("diagram.png"));
+    assert_eq!(attachment.file_size, Some(6));
+    assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+    assert!(
+        attachment
+            .url
+            .as_deref()
+            .is_some_and(|u| u.ends_with("/diagram.png"))
+    );
+    // Unmodelled fields are kept rather than dropped.
+    assert_eq!(attachment.extra.get("type"), Some(&json!("file")));
+
+    let raw = state.upload_bodies.lock().unwrap().last().cloned().unwrap();
+    let page_field = find_bytes(&raw, b"name=\"pageId\"").expect("pageId field");
+    let file_part = find_bytes(&raw, b"name=\"file\"; filename=\"diagram.png\"")
+        .expect("file part with filename");
+    // Docmost only sees fields that precede the file part.
+    assert!(
+        page_field < file_part,
+        "pageId must come before the file part"
+    );
+    assert!(find_bytes(&raw, PAGE_UUID.as_bytes()).is_some_and(|at| at < file_part));
+    assert!(
+        find_bytes(&raw, b"content-type: image/png").is_some()
+            || find_bytes(&raw, b"Content-Type: image/png").is_some()
+    );
+    assert!(find_bytes(&raw, PNG_ISH).is_some_and(|at| at > file_part));
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_attachment_accepts_enveloped_response() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    state.envelope_upload.store(true, Ordering::SeqCst);
+
+    let attachment = client
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await?;
+    assert_eq!(attachment.id, "0199aaaa-0000-7000-8000-000000000001");
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_attachment_retries_on_unauthorized() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    state.fail_first_401.store(true, Ordering::SeqCst);
+
+    client
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await?;
+    assert_eq!(state.login_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.upload_attempts.load(Ordering::SeqCst), 2);
+    // The rebuilt form on the retry still carries the whole file.
+    let raw = state.upload_bodies.lock().unwrap().last().cloned().unwrap();
+    assert!(find_bytes(&raw, PNG_ISH).is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_attachment_surfaces_server_error() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    state.force_status.store(403, Ordering::SeqCst);
+
+    let error = client
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await
+        .expect_err("403 must surface as an error");
+    assert!(error.to_string().contains("403"), "{error}");
+    assert!(state.upload_bodies.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_attachment_resolves_a_slug_to_the_page_uuid() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+
+    client
+        .upload_attachment("slug-1", "diagram.png", "image/png", PNG_ISH)
+        .await?;
+    let raw = state.upload_bodies.lock().unwrap().last().cloned().unwrap();
+    assert!(find_bytes(&raw, PAGE_UUID.as_bytes()).is_some());
+    assert!(
+        find_bytes(&raw, b"slug-1").is_none(),
+        "the slug must not be sent"
+    );
+
+    let error = client
+        .upload_attachment("no-such-slug", "diagram.png", "image/png", PNG_ISH)
+        .await
+        .expect_err("unknown page must fail before uploading");
+    assert!(error.to_string().contains("404"), "{error}");
+    assert_eq!(state.upload_bodies.lock().unwrap().len(), 1);
     Ok(())
 }

@@ -69,6 +69,16 @@ All notable changes are documented here. The format loosely follows
   `move_page` and `create_page`.
 
 ### Added
+- **`docmost_upload_attachment`** uploads a file to a page as a normal Docmost
+  attachment, through the same `POST /api/files/upload` call the editor makes. The
+  file is passed as base64 in the tool arguments, because a remote server cannot read
+  the client's filesystem. Files can be up to 2 MiB once decoded, which keeps the
+  request under the Streamable HTTP transport's 4 MiB body limit. The tool returns the attachment ID, the
+  Docmost-normalized file name, the size, and the relative `/api/files/{id}/{name}`
+  path to embed (`![alt](path)`) or link from page Markdown. It is a write tool,
+  so it is default-deny, needs `confirm: true` on each call, and writes metadata-only
+  audit entries. Slug IDs are resolved to the page UUID first: Docmost 0.96 accepts a slug for its
+  permission check but then fails to store the attachment.
 - CI: `cargo fmt --check`, strict `clippy -D warnings`, the test suite, a
   **production image build with a runtime smoke test**, and a dependency-advisory
   audit. The image build is what catches a broken `Dockerfile` COPY path — the

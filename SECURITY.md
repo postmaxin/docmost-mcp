@@ -64,7 +64,8 @@ user before sending `confirm: true`.
   requires `DOCMOST_ALLOW_FILE_CREDENTIALS=true`.
 
 The audit log records timestamp, operation, target identifier, and status only.
-It deliberately excludes page content, comment content, passwords, and tokens.
+It deliberately excludes page content, comment content, uploaded file contents,
+passwords, and tokens.
 
 ## Reporting a vulnerability
 

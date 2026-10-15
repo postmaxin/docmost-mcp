@@ -58,51 +58,26 @@ impl super::DocmostClient {
         space_id: &str,
         markdown: &str,
     ) -> Result<DocmostPage> {
-        let endpoint = "/api/pages/import";
-        let mut session = self.auth_manager.get_authenticated_session().await?;
-        let mut retry_on_unauthorized = true;
-
-        loop {
-            // A multipart Form cannot be cloned, so it is rebuilt for each attempt.
-            let form = reqwest::multipart::Form::new()
-                .text("spaceId", space_id.to_string())
-                .part(
-                    "file",
-                    reqwest::multipart::Part::bytes(markdown.as_bytes().to_vec())
-                        // Docmost validates the import type by file extension, not MIME,
-                        // so the name MUST end in `.md`.
-                        .file_name("page.md")
-                        .mime_str("text/markdown")?,
-                );
-
-            debug_log(
-                "api",
-                "Importing Docmost page",
-                Some(&serde_json::json!({
-                    "endpoint": endpoint,
-                    "baseUrl": session.base_url,
-                    "spaceId": space_id,
-                    "retryOnUnauthorized": retry_on_unauthorized
-                })),
-            );
-
-            let response = self
-                .http
-                .post(format!("{}{}", session.base_url, endpoint))
-                .bearer_auth(&session.token)
-                .multipart(form)
-                .send()
-                .await
-                .with_context(|| format!("Failed to call {endpoint}"))?;
-
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && retry_on_unauthorized {
-                session = self.auth_manager.reauthenticate().await?;
-                retry_on_unauthorized = false;
-                continue;
-            }
-
-            return super::parse_response(response).await;
-        }
+        debug_log(
+            "api",
+            "Importing Docmost page",
+            Some(&serde_json::json!({ "spaceId": space_id })),
+        );
+        let response = self
+            .send_multipart("/api/pages/import", || {
+                Ok(reqwest::multipart::Form::new()
+                    .text("spaceId", space_id.to_string())
+                    .part(
+                        "file",
+                        reqwest::multipart::Part::bytes(markdown.as_bytes().to_vec())
+                            // Docmost validates the import type by file extension, not MIME,
+                            // so the name MUST end in `.md`.
+                            .file_name("page.md")
+                            .mime_str("text/markdown")?,
+                    ))
+            })
+            .await?;
+        super::parse_response(response).await
     }
 
     pub async fn update_page(

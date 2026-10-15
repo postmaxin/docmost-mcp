@@ -130,10 +130,14 @@ loaded alongside this one.
 **Write** — `docmost_create_page`, `docmost_update_page`, `docmost_duplicate_page`,
 `docmost_copy_page_to_space`, `docmost_move_page`, `docmost_move_page_to_space`,
 `docmost_create_space`, `docmost_update_space`, `docmost_create_comment`,
-`docmost_update_comment`
+`docmost_update_comment`, `docmost_upload_attachment`
 
 Write tools are gated twice — see [docs/write-tools.md](docs/write-tools.md) for the
 confirmation contract.
+
+`docmost_upload_attachment` takes the file as base64 in the call (up to 2 MiB), since
+a remote server cannot read the client's disk. It returns the attachment's
+`/api/files/{id}/{name}` path, which page Markdown can embed (`![alt](path)`) or link.
 
 ### Pagination
 
@@ -157,7 +161,7 @@ when it hasn't, and never pages forever off a bad inference.
 - **Mutating tools are disabled** unless `DOCMOST_MCP_ENABLE_WRITES=true`, *and*
   every mutation additionally requires `confirm: true` in that individual call.
 - Mutation *metadata* is appended to a mode-`0600` JSONL audit log. Page and comment
-  bodies are never logged.
+  bodies and uploaded file contents are never logged.
 - Credentials come from environment variables or the OS keychain. The
   encrypted-file fallback is opt-in.
 

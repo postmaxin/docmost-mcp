@@ -53,6 +53,7 @@ async fn server_lists_expected_tools() -> Result<()> {
         "docmost_update_space",
         "docmost_create_comment",
         "docmost_update_comment",
+        "docmost_upload_attachment",
     ] {
         assert!(
             tool_names.iter().any(|name| name == expected),
@@ -63,7 +64,7 @@ async fn server_lists_expected_tools() -> Result<()> {
     // Exactly the expected surface: no accidental extra/duplicate registration.
     assert_eq!(
         tool_names.len(),
-        20,
+        21,
         "unexpected tool count: {tool_names:?}"
     );
     let mut unique = tool_names.clone();
@@ -193,6 +194,10 @@ async fn server_required_input_fields_are_present() -> Result<()> {
         ("docmost_update_space", "confirm"),
         ("docmost_create_comment", "confirm"),
         ("docmost_update_comment", "confirm"),
+        ("docmost_upload_attachment", "page_id"),
+        ("docmost_upload_attachment", "file_name"),
+        ("docmost_upload_attachment", "content_base64"),
+        ("docmost_upload_attachment", "confirm"),
     ] {
         let tool = tools
             .tools
@@ -220,6 +225,53 @@ async fn server_required_input_fields_are_present() -> Result<()> {
             "{tool_name}.{property_name} should be required"
         );
     }
+
+    client.cancel().await?;
+    server_handle.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_upload_attachment_validates_then_enforces_write_gate() -> Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+
+    let server_handle = tokio::spawn(async move {
+        // Writes are not enabled in this test process (DOCMOST_MCP_ENABLE_WRITES unset).
+        let server = DocmostMcpServer::new(StartupConfig::default())?;
+        server.serve(server_transport).await?.waiting().await?;
+        anyhow::Ok(())
+    });
+
+    let client = DummyClientHandler.serve(client_transport).await?;
+    let call = |file_name: &str, content: &str| {
+        let arguments = serde_json::json!({
+            "confirm": true,
+            "page_id": "page-1",
+            "file_name": file_name,
+            "content_base64": content,
+        });
+        CallToolRequestParams::new("docmost_upload_attachment")
+            .with_arguments(arguments.as_object().cloned().unwrap())
+    };
+
+    // Malformed arguments are rejected on their own merits, before the write gate.
+    let bad_path = client.call_tool(call("../x.txt", "aGk=")).await;
+    assert!(
+        format!("{bad_path:?}").contains("not a path"),
+        "{bad_path:?}"
+    );
+    let bad_base64 = client.call_tool(call("x.txt", "%%%")).await;
+    assert!(
+        format!("{bad_base64:?}").contains("base64"),
+        "{bad_base64:?}"
+    );
+
+    // A well-formed call is still refused while writes are disabled.
+    let disabled = client.call_tool(call("x.txt", "aGk=")).await;
+    assert!(
+        format!("{disabled:?}").contains("DOCMOST_MCP_ENABLE_WRITES"),
+        "{disabled:?}"
+    );
 
     client.cancel().await?;
     server_handle.await??;

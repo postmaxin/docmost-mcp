@@ -11,6 +11,7 @@ use crate::docmost_client::DocmostClient;
 
 mod render;
 mod tools;
+mod tools_attachment;
 mod tools_page_write;
 mod tools_write;
 

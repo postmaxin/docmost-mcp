@@ -334,3 +334,22 @@ pub struct DocmostCurrentUserResponse {
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
+
+/// A file attachment as returned by Docmost's `POST /api/files/upload`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DocmostAttachment {
+    pub id: String,
+    pub file_name: Option<String>,
+    pub file_size: Option<u64>,
+    pub file_ext: Option<String>,
+    pub mime_type: Option<String>,
+    pub page_id: Option<String>,
+    pub space_id: Option<String>,
+    /// Absolute download URL built from Docmost's `APP_URL`; optional so a server that
+    /// omits it still parses.
+    pub url: Option<String>,
+    /// Every field Docmost returned that this struct does not model.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
