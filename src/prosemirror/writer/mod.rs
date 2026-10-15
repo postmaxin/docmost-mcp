@@ -12,8 +12,11 @@ use super::nodes::Frame;
 ///
 /// This is the inverse of [`super::prosemirror_to_markdown`]. It emits the same node and
 /// mark `type` strings (and attr keys) the reader recognizes — note the Tiptap-style mark
-/// names `bold`/`italic` (not `strong`/`em`) — so the two round-trip. The `embed` node has
-/// no Markdown form and is never produced.
+/// names `bold`/`italic` (not `strong`/`em`) — so the two round-trip.
+///
+/// A bare link — one whose text is its URL, such as `[url](url)` or `<url>` — to a provider
+/// Docmost embeds (YouTube, Vimeo, Loom, ...) becomes a block `embed` node, as it does
+/// through Docmost's own Markdown import. The reader renders an embed in that form.
 ///
 /// Mentions use a link-style convention: `[Label](user:UUID)` becomes a user mention and
 /// `[Label](page:UUID)` a page mention (any other link URL stays an ordinary link).
@@ -42,10 +45,18 @@ struct Mention {
     label: String,
 }
 
+/// An open link in a paragraph: its URL and where its text starts in the paragraph's
+/// content, so a bare provider link can be swapped for an `embed` when it closes.
+struct PendingLink {
+    href: String,
+    start: usize,
+}
+
 struct DocBuilder {
     stack: Vec<Frame>,
     marks: Vec<Value>,
     in_table_head: bool,
     image: Option<ImageState>,
     pending_mention: Option<Mention>,
+    pending_link: Option<PendingLink>,
 }

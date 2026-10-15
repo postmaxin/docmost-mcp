@@ -3,7 +3,8 @@
 use pulldown_cmark::{CodeBlockKind, Event, Tag, TagEnd};
 use serde_json::{Map, Value, json};
 
-use super::{DocBuilder, ImageState, Mention};
+use super::{DocBuilder, ImageState, Mention, PendingLink};
+use crate::prosemirror::embed::embed_provider;
 use crate::prosemirror::nodes::{
     Frame, heading_level, is_whitespace_text, mention_node, text_node,
 };
@@ -16,6 +17,7 @@ impl DocBuilder {
             in_table_head: false,
             image: None,
             pending_mention: None,
+            pending_link: None,
         }
     }
 
@@ -115,10 +117,57 @@ impl DocBuilder {
                     label: String::new(),
                 });
             }
-            _ => self
-                .marks
-                .push(json!({ "type": "link", "attrs": { "href": url } })),
+            _ => {
+                self.pending_link = match self.stack.last() {
+                    Some(frame) if frame.node_type == "paragraph" => Some(PendingLink {
+                        href: url.to_string(),
+                        start: frame.content.len(),
+                    }),
+                    _ => None,
+                };
+                self.marks
+                    .push(json!({ "type": "link", "attrs": { "href": url } }));
+            }
         }
+    }
+
+    /// Replace a just-closed bare link (its text is exactly its URL) to a provider Docmost
+    /// embeds with an `embed` node. `finish_paragraph` later lifts it out to block level.
+    fn finish_link(&mut self) {
+        let Some(link) = self.pending_link.take() else {
+            return;
+        };
+        let Some(provider) = embed_provider(&link.href) else {
+            return;
+        };
+        let Some(frame) = self.stack.last_mut() else {
+            return;
+        };
+        if frame.node_type != "paragraph" || link.start >= frame.content.len() {
+            return;
+        }
+        let mut text = String::new();
+        for node in &frame.content[link.start..] {
+            if node.get("type").and_then(Value::as_str) != Some("text") {
+                return;
+            }
+            text.push_str(node.get("text").and_then(Value::as_str).unwrap_or(""));
+        }
+        if text != link.href {
+            return;
+        }
+        frame.content.truncate(link.start);
+        // The attrs Docmost's Markdown import gives an embed.
+        frame.content.push(json!({
+            "type": "embed",
+            "attrs": {
+                "src": link.href,
+                "provider": provider,
+                "align": "center",
+                "width": "640",
+                "height": "480",
+            }
+        }));
     }
 
     fn end(&mut self, tag: TagEnd) {
@@ -131,6 +180,7 @@ impl DocBuilder {
                     self.finish_mention();
                 } else {
                     self.pop_mark("link");
+                    self.finish_link();
                 }
             }
             TagEnd::Image => self.finish_image(),
@@ -279,8 +329,37 @@ impl DocBuilder {
             for image in std::mem::take(&mut frame.content) {
                 self.append_to_top(image);
             }
+        } else if frame.content.iter().any(is_embed) {
+            // An embed is a block node: split the paragraph around it, as Docmost's
+            // import does.
+            let mut inline = Vec::new();
+            for child in std::mem::take(&mut frame.content) {
+                if is_embed(&child) {
+                    self.append_paragraph(std::mem::take(&mut inline));
+                    self.append_to_top(child);
+                } else {
+                    inline.push(child);
+                }
+            }
+            self.append_paragraph(inline);
         } else {
             self.append_to_top(frame.into_value());
+        }
+    }
+
+    /// Append `inline` as a paragraph, minus whitespace-only text (the soft break that
+    /// separated it from an embed) at either end; nothing if that leaves it empty.
+    fn append_paragraph(&mut self, mut inline: Vec<Value>) {
+        while inline.last().is_some_and(is_whitespace_text) {
+            inline.pop();
+        }
+        let leading = inline
+            .iter()
+            .take_while(|node| is_whitespace_text(node))
+            .count();
+        inline.drain(..leading);
+        if !inline.is_empty() {
+            self.append_to_top(json!({ "type": "paragraph", "content": inline }));
         }
     }
 
@@ -347,4 +426,8 @@ impl DocBuilder {
             .map(Frame::into_value)
             .unwrap_or_else(|| json!({ "type": "doc", "content": [] }))
     }
+}
+
+fn is_embed(node: &Value) -> bool {
+    node.get("type").and_then(Value::as_str) == Some("embed")
 }
