@@ -119,6 +119,7 @@ impl HttpServerConfig {
                     .context("DOCMOST_BASE_URL is required for account authentication")?,
                 browser_url: env::var("DOCMOST_MCP_BROWSER_URL").ok(),
                 client_id_key_path: Some(client_id_key_path()?),
+                refresh_token_key_path: Some(refresh_token_key_path()?),
                 brand: env::var("DOCMOST_MCP_BRAND").unwrap_or_else(|_| DEFAULT_BRAND.to_string()),
             })
         } else {
@@ -153,6 +154,21 @@ fn client_id_key_path() -> Result<std::path::PathBuf> {
     Ok(dirs::home_dir()
         .context("Unable to determine home directory for the client_id key")?
         .join(".docmost-local-mcp/client-id.key"))
+}
+
+/// `DOCMOST_MCP_REFRESH_KEY_FILE`, else
+/// `~/.docmost-local-mcp/refresh-token.key` (next to the mutation audit log).
+fn refresh_token_key_path() -> Result<std::path::PathBuf> {
+    if let Some(path) = env::var("DOCMOST_MCP_REFRESH_KEY_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(path.into());
+    }
+    Ok(dirs::home_dir()
+        .context("Unable to determine home directory for the refresh-token key")?
+        .join(".docmost-local-mcp/refresh-token.key"))
 }
 
 fn comma_separated_env(name: &str) -> Option<Vec<String>> {
@@ -679,6 +695,7 @@ mod tests {
                     browser_url: None,
                     brand: DEFAULT_BRAND.to_string(),
                     client_id_key_path: None,
+                    refresh_token_key_path: None,
                 }),
             },
         )?;

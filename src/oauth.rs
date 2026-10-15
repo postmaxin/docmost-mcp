@@ -4,7 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use aes_gcm::aead::{OsRng, rand_core::RngCore};
+use aes_gcm::{
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, OsRng, Payload, rand_core::RngCore},
+};
 use axum::{
     Form, Json, Router,
     extract::{DefaultBodyLimit, Query, State},
@@ -44,7 +47,16 @@ const CLIENT_ID_PREFIX: &str = "dmc1";
 const MAX_PENDING_AUTHORIZATIONS: usize = 4_096;
 const MAX_COMPLETED_AUTHORIZATIONS: usize = 4_096;
 const MAX_ACCESS_GRANTS: usize = 8_192;
-const MAX_REFRESH_GRANTS: usize = 4_096;
+/// Upper bound on the refresh-token families tracked for rotation. One family
+/// is one authorization (consent), however often it has been refreshed.
+const MAX_REFRESH_FAMILIES: usize = 4_096;
+/// Versions the sealed refresh-token format so it can change without
+/// misreading old tokens. Also bound into the AEAD associated data.
+const REFRESH_TOKEN_PREFIX: &str = "dmr1";
+/// Anything longer cannot have been issued here, so it is rejected before
+/// any decoding work.
+const MAX_REFRESH_TOKEN_LENGTH: usize = 8_192;
+const AES_GCM_NONCE_BYTES: usize = 12;
 const DEFAULT_SCOPE: &str = "docmost";
 /// Product name on the sign-in pages when the operator sets no `DOCMOST_MCP_BRAND`.
 pub const DEFAULT_BRAND: &str = "Docmost";
@@ -69,6 +81,11 @@ pub struct OAuthConfig {
     /// key would strand them on an `invalid_client` page. None generates a
     /// key per process (tests).
     pub client_id_key_path: Option<PathBuf>,
+    /// File holding the AES-256-GCM key that seals refresh tokens, created on
+    /// first start. Persisting it keeps issued refresh tokens redeemable
+    /// across restarts, so clients refresh instead of signing in again.
+    /// None generates a key per process (tests).
+    pub refresh_token_key_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -88,7 +105,15 @@ struct OAuthInner {
     completed: RwLock<HashMap<String, CompletedAuthorization>>,
     codes: RwLock<HashMap<String, AuthorizationCode>>,
     access_tokens: RwLock<HashMap<String, AccessGrant>>,
-    refresh_tokens: RwLock<HashMap<String, RefreshGrant>>,
+    /// Seals refresh tokens (see OAuthConfig::refresh_token_key_path). The
+    /// server stores no refresh tokens; the client holds them, encrypted.
+    refresh_cipher: Aes256Gcm,
+    /// Associated data for sealed refresh tokens: format version, this MCP
+    /// resource and the Docmost it fronts, so a token only opens here.
+    refresh_token_aad: String,
+    /// Rotation state per refresh-token family, keyed by family id. Memory
+    /// only: it holds no credentials, and is rebuilt as clients refresh.
+    refresh_families: RwLock<HashMap<String, RefreshFamily>>,
     login_failures: RwLock<HashMap<String, Vec<DateTime<Utc>>>>,
 }
 
@@ -143,11 +168,44 @@ struct AccessGrant {
     expires_at: DateTime<Utc>,
 }
 
-#[derive(Clone)]
+/// What a refresh token carries. It is sealed with AES-256-GCM and handed to
+/// the client (`dmr1.<base64url nonce || ciphertext>`); nothing is stored
+/// server-side, so it survives a restart. The Docmost session inside is
+/// therefore never written to this server's disk; the client holds it,
+/// encrypted under a key only this server has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RefreshGrant {
-    client_id: String,
+    /// SHA-256 of the client_id it was issued to (fixed size whatever the
+    /// client_id format).
+    #[serde(rename = "c")]
+    client_hash: String,
+    #[serde(rename = "s")]
     scope: String,
-    session: AuthenticatedSession,
+    #[serde(rename = "m")]
+    email: String,
+    /// The Docmost session token (authToken JWT).
+    #[serde(rename = "t")]
+    token: String,
+    #[serde(rename = "x", default, skip_serializing_if = "Option::is_none")]
+    session_expires_at: Option<String>,
+    #[serde(rename = "e", with = "chrono::serde::ts_seconds")]
+    expires_at: DateTime<Utc>,
+    /// Random id shared by every token rotated from one authorization.
+    #[serde(rename = "f")]
+    family: String,
+    /// Position in the family's rotation; with `family`, this token's unique id.
+    #[serde(rename = "g")]
+    generation: u64,
+}
+
+/// Rotation state for one refresh-token family. Only the newest generation
+/// is redeemable; presenting an older one means a token was copied, so the
+/// whole family is revoked (RFC 9700 section 4.14.2).
+struct RefreshFamily {
+    /// The generation of the one token in this family that may be redeemed.
+    current: u64,
+    revoked: bool,
+    session_fingerprint: String,
     expires_at: DateTime<Utc>,
 }
 
@@ -218,22 +276,32 @@ impl OAuthState {
             .as_deref()
             .map(normalize_public_url)
             .transpose()?;
+        let resource_url = format!("{public_url}/mcp");
+        let docmost_base_url = normalize_base_url(&config.docmost_base_url);
+        let refresh_key = match &config.refresh_token_key_path {
+            Some(path) => load_or_create_key(path)?,
+            None => random_key(),
+        };
         Ok(Self {
             inner: Arc::new(OAuthInner {
                 browser_url,
-                resource_url: format!("{public_url}/mcp"),
+                refresh_token_aad: format!(
+                    "{REFRESH_TOKEN_PREFIX}\n{resource_url}\n{docmost_base_url}"
+                ),
+                resource_url,
                 public_url,
-                docmost_base_url: normalize_base_url(&config.docmost_base_url),
+                docmost_base_url,
                 brand: normalize_brand(&config.brand),
                 client_id_key: match &config.client_id_key_path {
-                    Some(path) => load_or_create_client_id_key(path)?,
+                    Some(path) => load_or_create_key(path)?,
                     None => random_key(),
                 },
                 pending: RwLock::new(HashMap::new()),
                 completed: RwLock::new(HashMap::new()),
                 codes: RwLock::new(HashMap::new()),
                 access_tokens: RwLock::new(HashMap::new()),
-                refresh_tokens: RwLock::new(HashMap::new()),
+                refresh_cipher: Aes256Gcm::new(&refresh_key.into()),
+                refresh_families: RwLock::new(HashMap::new()),
                 login_failures: RwLock::new(HashMap::new()),
             }),
         })
@@ -301,11 +369,12 @@ impl OAuthState {
         );
         active.extend(
             self.inner
-                .refresh_tokens
+                .refresh_families
                 .read()
                 .await
                 .values()
-                .map(|grant| Self::session_fingerprint(&grant.session)),
+                .filter(|family| !family.revoked)
+                .map(|family| family.session_fingerprint.clone()),
         );
         active
     }
@@ -325,11 +394,15 @@ impl OAuthState {
             .write()
             .await
             .retain(|_, grant| !carries(&grant.session));
-        self.inner
-            .refresh_tokens
-            .write()
-            .await
-            .retain(|_, grant| !carries(&grant.session));
+        // Refresh tokens are sealed and held by the client, so they cannot be
+        // deleted; revoke their families instead. A family this process has
+        // not seen since a restart is caught when it refreshes: Docmost
+        // rejects the session there too.
+        for family in self.inner.refresh_families.write().await.values_mut() {
+            if constant_time_equal(&family.session_fingerprint, fingerprint) {
+                family.revoked = true;
+            }
+        }
         self.inner
             .codes
             .write()
@@ -348,10 +421,10 @@ impl OAuthState {
     ) -> (String, String) {
         let response = issue_tokens(
             self,
-            client_id.to_string(),
+            token_hash(client_id),
             DEFAULT_SCOPE.to_string(),
             session,
-            true,
+            (random_token(16), 1),
         )
         .await;
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -793,7 +866,14 @@ async fn exchange_authorization_code(state: &OAuthState, form: TokenForm) -> Res
         );
     }
 
-    issue_tokens(state, grant.client_id, grant.scope, grant.session, true).await
+    issue_tokens(
+        state,
+        token_hash(&grant.client_id),
+        grant.scope,
+        grant.session,
+        (random_token(16), 1),
+    )
+    .await
 }
 
 async fn exchange_refresh_token(state: &OAuthState, form: TokenForm) -> Response {
@@ -804,77 +884,136 @@ async fn exchange_refresh_token(state: &OAuthState, form: TokenForm) -> Response
             "refresh_token is required.",
         );
     };
-    let grant = state
-        .inner
-        .refresh_tokens
-        .write()
-        .await
-        .remove(&token_hash(&refresh_token));
-    let Some(grant) = grant else {
+    let Some(grant) = open_refresh_token(&state.inner, &refresh_token) else {
         return oauth_json_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "Refresh token is invalid.",
         );
     };
-    if grant.expires_at <= Utc::now()
-        || form
-            .client_id
-            .as_deref()
-            .is_some_and(|client_id| client_id != grant.client_id)
-    {
+    if grant.expires_at <= Utc::now() {
         return oauth_json_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "Docmost session expired; sign in again.",
         );
     }
-    // A refresh is the one point a client asks for new credentials without
-    // touching Docmost, so check the session here rather than minting fresh
-    // tokens for one Docmost has already revoked.
-    if docmost_rejects_session(&grant.session).await {
+    if form
+        .client_id
+        .as_deref()
+        .is_some_and(|client_id| !constant_time_equal(&token_hash(client_id), &grant.client_hash))
+    {
+        return oauth_json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Refresh token was not issued to this client.",
+        );
+    }
+    if let Err(response) = claim_refresh_generation(state, &grant).await {
+        return *response;
+    }
+
+    let session = AuthenticatedSession {
+        base_url: state.inner.docmost_base_url.clone(),
+        email: grant.email,
+        token: grant.token,
+        expires_at: grant.session_expires_at,
+    };
+    // The refresh token outlives any restart, so ask Docmost whether the
+    // session it carries is still good before minting tokens from it. Signing
+    // out of Docmost (or an admin revoking the session) thereby also cuts off
+    // agents at their next refresh. Only an explicit rejection counts: if
+    // Docmost cannot be reached, every tool call fails anyway until it can.
+    if let DocmostSession::Rejected = docmost_session(state, session.token.clone()).await {
+        // Same as a rejection seen during a tool call: drop the session's
+        // access tokens and codes and revoke its refresh families, so the
+        // client goes back through OAuth for a fresh session.
         state
-            .revoke_session(&OAuthState::session_fingerprint(&grant.session))
+            .revoke_session(&OAuthState::session_fingerprint(&session))
             .await;
         return oauth_json_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
-            "Docmost rejected this account session; sign in again.",
+            "Docmost no longer accepts this session; sign in again.",
         );
     }
 
-    issue_tokens(state, grant.client_id, grant.scope, grant.session, true).await
+    issue_tokens(
+        state,
+        grant.client_hash,
+        grant.scope,
+        session,
+        (grant.family, grant.generation + 1),
+    )
+    .await
 }
 
-/// True only when Docmost explicitly answers 401 for this session. A network
-/// failure is not proof of revocation; the next tool call would surface a real
-/// rejection anyway.
-async fn docmost_rejects_session(session: &AuthenticatedSession) -> bool {
-    let Ok(http) = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    else {
-        return false;
+/// Single use: marks this token's generation spent, so a second redemption
+/// (a copied token, or a concurrent request) fails. Presenting a spent
+/// generation revokes the whole family. A family this process has not seen
+/// (it was issued before a restart) starts being tracked here.
+async fn claim_refresh_generation(
+    state: &OAuthState,
+    grant: &RefreshGrant,
+) -> Result<(), Box<Response>> {
+    cleanup_expired(state).await;
+    let mut families = state.inner.refresh_families.write().await;
+    let reused = || {
+        Box::new(oauth_json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Refresh token was already used; sign in again.",
+        ))
     };
-    http.post(format!("{}/api/users/me", session.base_url))
-        .bearer_auth(&session.token)
-        .json(&json!({}))
-        .send()
-        .await
-        .is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+    let full = families.len() >= MAX_REFRESH_FAMILIES;
+    match families.get_mut(&grant.family) {
+        Some(family) if family.revoked => Err(Box::new(oauth_json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "This authorization was revoked; sign in again.",
+        ))),
+        Some(family) if family.current != grant.generation => {
+            family.revoked = true;
+            Err(reused())
+        }
+        Some(family) => {
+            family.current = grant.generation + 1;
+            Ok(())
+        }
+        None if full => Err(Box::new(oauth_json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "Authorization grant capacity is temporarily exhausted.",
+        ))),
+        None => {
+            families.insert(
+                grant.family.clone(),
+                RefreshFamily {
+                    current: grant.generation + 1,
+                    revoked: false,
+                    session_fingerprint: token_hash(&grant.token),
+                    expires_at: grant.expires_at,
+                },
+            );
+            Ok(())
+        }
+    }
 }
 
+/// Issues an access token and the refresh token at `refresh` (family id,
+/// generation). Generation 1 starts a new family.
 async fn issue_tokens(
     state: &OAuthState,
-    client_id: String,
+    client_hash: String,
     scope: String,
     session: AuthenticatedSession,
-    include_refresh: bool,
+    refresh: (String, u64),
 ) -> Response {
     cleanup_expired(state).await;
+    let (family, generation) = refresh;
     if state.inner.access_tokens.read().await.len() >= MAX_ACCESS_GRANTS
-        || (include_refresh && state.inner.refresh_tokens.read().await.len() >= MAX_REFRESH_GRANTS)
+        || (generation == 1
+            && state.inner.refresh_families.read().await.len() >= MAX_REFRESH_FAMILIES)
     {
         return oauth_json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -900,37 +1039,53 @@ async fn issue_tokens(
         );
     }
 
+    let refresh_expiry = docmost_expiry.unwrap_or(access_expiry);
+    let grant = RefreshGrant {
+        client_hash,
+        scope: scope.clone(),
+        email: session.email.clone(),
+        token: session.token.clone(),
+        session_expires_at: session.expires_at.clone(),
+        expires_at: refresh_expiry,
+        family: family.clone(),
+        generation,
+    };
+    let Some(refresh_token) = seal_refresh_token(&state.inner, &grant) else {
+        return oauth_json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Could not issue a refresh token.",
+        );
+    };
+    state
+        .inner
+        .refresh_families
+        .write()
+        .await
+        .entry(family)
+        .and_modify(|entry| entry.expires_at = refresh_expiry)
+        .or_insert_with(|| RefreshFamily {
+            current: generation,
+            revoked: false,
+            session_fingerprint: token_hash(&session.token),
+            expires_at: refresh_expiry,
+        });
+
     let access_token = random_token(32);
     state.inner.access_tokens.write().await.insert(
         token_hash(&access_token),
         AccessGrant {
-            session: session.clone(),
+            session,
             expires_at: access_expiry,
         },
     );
-
-    let refresh_token = if include_refresh {
-        let token = random_token(32);
-        state.inner.refresh_tokens.write().await.insert(
-            token_hash(&token),
-            RefreshGrant {
-                client_id,
-                scope: scope.clone(),
-                session,
-                expires_at: docmost_expiry.unwrap_or(access_expiry),
-            },
-        );
-        Some(token)
-    } else {
-        None
-    };
 
     Json(TokenResponse {
         access_token,
         token_type: "Bearer",
         expires_in: (access_expiry - now).num_seconds(),
         scope,
-        refresh_token,
+        refresh_token: Some(refresh_token),
     })
     .into_response()
 }
@@ -1047,30 +1202,60 @@ fn native_host_matches(state: &OAuthState, headers: &HeaderMap) -> bool {
 async fn native_session(state: &OAuthState, headers: &HeaderMap) -> Option<AuthenticatedSession> {
     let token = cookie_value(headers, "authToken")?;
     let token = urlencoding::decode(&token).ok()?.into_owned();
-    let http = reqwest::Client::builder()
+    match docmost_session(state, token).await {
+        DocmostSession::Valid(session) => Some(session),
+        DocmostSession::Rejected | DocmostSession::Unavailable => None,
+    }
+}
+
+/// Docmost's verdict on a session token, from `/api/users/me`.
+enum DocmostSession {
+    Valid(AuthenticatedSession),
+    /// Docmost answered 401 or 403: signed out, revoked or expired.
+    Rejected,
+    /// No usable answer (network error, 5xx, unexpected body).
+    Unavailable,
+}
+
+async fn docmost_session(state: &OAuthState, token: String) -> DocmostSession {
+    let Ok(http) = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .ok()?;
-    let response = http
+    else {
+        return DocmostSession::Unavailable;
+    };
+    let Ok(response) = http
         .post(format!("{}/api/users/me", state.inner.docmost_base_url))
         .bearer_auth(&token)
         .json(&json!({}))
         .send()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+    else {
+        return DocmostSession::Unavailable;
+    };
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        return DocmostSession::Rejected;
     }
-    let body: serde_json::Value = response.json().await.ok()?;
-    let email = body
+    if !response.status().is_success() {
+        return DocmostSession::Unavailable;
+    }
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return DocmostSession::Unavailable;
+    };
+    let Some(email) = body
         .pointer("/data/user/email")
-        .or_else(|| body.pointer("/user/email"))?
-        .as_str()?
-        .to_string();
-    Some(AuthenticatedSession {
+        .or_else(|| body.pointer("/user/email"))
+        .and_then(|email| email.as_str())
+    else {
+        return DocmostSession::Unavailable;
+    };
+    DocmostSession::Valid(AuthenticatedSession {
         base_url: state.inner.docmost_base_url.clone(),
-        email,
+        email: email.to_string(),
         expires_at: crate::auth::manager::get_jwt_expiry_iso(&token),
         token,
     })
@@ -1276,10 +1461,10 @@ fn random_key() -> [u8; 32] {
     key
 }
 
-/// Reads the 32-byte client_id key, creating it (mode 0600, directory 0700)
-/// if absent. Creation is exclusive, so concurrent first starts agree on one
-/// key.
-fn load_or_create_client_id_key(path: &Path) -> anyhow::Result<[u8; 32]> {
+/// Reads a 32-byte key, creating it (mode 0600, directory 0700) if absent.
+/// Creation is exclusive, so concurrent first starts agree on one key. A file
+/// of any other length is an error rather than being silently replaced.
+fn load_or_create_key(path: &Path) -> anyhow::Result<[u8; 32]> {
     use anyhow::Context as _;
     use std::io::Write as _;
 
@@ -1321,9 +1506,7 @@ fn load_or_create_client_id_key(path: &Path) -> anyhow::Result<[u8; 32]> {
             Ok(key)
         }
         // Another process created it first: use theirs.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            load_or_create_client_id_key(path)
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => load_or_create_key(path),
         Err(error) => Err(error).with_context(|| format!("Failed to create {}", path.display())),
     }
 }
@@ -1361,6 +1544,59 @@ fn client_id_mac(key: &[u8; 32], signed: &str) -> Hmac<Sha256> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(signed.as_bytes());
     mac
+}
+
+/// `dmr1.<base64url(nonce || AES-256-GCM ciphertext and tag)>`, with a fresh
+/// random 96-bit nonce per token.
+fn seal_refresh_token(inner: &OAuthInner, grant: &RefreshGrant) -> Option<String> {
+    let plaintext = serde_json::to_vec(grant).ok()?;
+    let mut nonce = [0_u8; AES_GCM_NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = inner
+        .refresh_cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: inner.refresh_token_aad.as_bytes(),
+            },
+        )
+        .ok()?;
+    let mut sealed = nonce.to_vec();
+    sealed.extend_from_slice(&ciphertext);
+    Some(format!(
+        "{REFRESH_TOKEN_PREFIX}.{}",
+        URL_SAFE_NO_PAD.encode(sealed)
+    ))
+}
+
+/// The grant a refresh token carries, if this server sealed it (under the
+/// current key, for this resource) and it is unmodified. Expiry and reuse are
+/// checked by the caller.
+fn open_refresh_token(inner: &OAuthInner, token: &str) -> Option<RefreshGrant> {
+    if token.len() > MAX_REFRESH_TOKEN_LENGTH {
+        return None;
+    }
+    let (prefix, sealed) = token.split_once('.')?;
+    if prefix != REFRESH_TOKEN_PREFIX {
+        return None;
+    }
+    let sealed = URL_SAFE_NO_PAD.decode(sealed).ok()?;
+    if sealed.len() <= AES_GCM_NONCE_BYTES {
+        return None;
+    }
+    let (nonce, ciphertext) = sealed.split_at(AES_GCM_NONCE_BYTES);
+    let plaintext = inner
+        .refresh_cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: inner.refresh_token_aad.as_bytes(),
+            },
+        )
+        .ok()?;
+    serde_json::from_slice(&plaintext).ok()
 }
 
 fn token_hash(token: &str) -> String {
@@ -1422,10 +1658,10 @@ async fn cleanup_expired(state: &OAuthState) {
         .retain(|_, grant| grant.expires_at > now);
     state
         .inner
-        .refresh_tokens
+        .refresh_families
         .write()
         .await
-        .retain(|_, grant| grant.expires_at > now);
+        .retain(|_, family| family.expires_at > now);
     let window_start = now - Duration::minutes(LOGIN_FAILURE_WINDOW_MINUTES);
     state
         .inner
@@ -1592,11 +1828,11 @@ mod tests {
     fn client_id_key_persists_across_restarts() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state/client-id.key");
-        let first = load_or_create_client_id_key(&path)?;
+        let first = load_or_create_key(&path)?;
         let client_id = issue_client_id(&first, &test_client()).unwrap();
 
         // A restart reads the same key, so the cached client_id still works.
-        let second = load_or_create_client_id_key(&path)?;
+        let second = load_or_create_key(&path)?;
         assert_eq!(first, second);
         assert_eq!(decode_client_id(&second, &client_id), Some(test_client()));
 
@@ -1612,7 +1848,7 @@ mod tests {
         }
 
         std::fs::write(&path, b"short")?;
-        assert!(load_or_create_client_id_key(&path).is_err());
+        assert!(load_or_create_key(&path).is_err());
         Ok(())
     }
 
@@ -1637,6 +1873,7 @@ mod tests {
             brand: DEFAULT_BRAND.into(),
             browser_url: None,
             client_id_key_path: None,
+            refresh_token_key_path: None,
         })?;
         let router = state.clone().routes();
         let server = tokio::spawn(async move {
@@ -1757,6 +1994,7 @@ mod tests {
             brand: DEFAULT_BRAND.to_string(),
             browser_url: Some(base.clone()),
             client_id_key_path: None,
+            refresh_token_key_path: None,
         })?;
         let server = {
             let router = state.clone().routes();
@@ -1903,6 +2141,7 @@ mod tests {
             brand: DEFAULT_BRAND.into(),
             browser_url: Some("https://docs.example.com".into()),
             client_id_key_path: None,
+            refresh_token_key_path: None,
         })
         .unwrap();
         let mut headers = HeaderMap::new();
@@ -1928,6 +2167,7 @@ mod tests {
             brand: DEFAULT_BRAND.to_string(),
             browser_url: None,
             client_id_key_path: None,
+            refresh_token_key_path: None,
         })
         .expect("state builds");
 
@@ -1983,6 +2223,7 @@ mod tests {
             brand: DEFAULT_BRAND.to_string(),
             browser_url: None,
             client_id_key_path: None,
+            refresh_token_key_path: None,
         })?;
         let oauth_task = {
             let app = oauth_state.clone().routes();
@@ -2155,5 +2396,398 @@ mod tests {
         let marker = "id=\"continue-to-client\" href=\"";
         let remainder = html.split_once(marker)?.1;
         Some(remainder.split_once('"')?.0.replace("&amp;", "&"))
+    }
+
+    // --- Sealed refresh tokens ---
+
+    const TEST_CLIENT: &str = "test-client";
+
+    fn refresh_test_state(
+        docmost_base_url: &str,
+        refresh_token_key_path: Option<PathBuf>,
+    ) -> OAuthState {
+        OAuthState::new(OAuthConfig {
+            public_url: "http://localhost:8787".into(),
+            docmost_base_url: docmost_base_url.into(),
+            brand: DEFAULT_BRAND.into(),
+            browser_url: None,
+            refresh_token_key_path,
+            client_id_key_path: None,
+        })
+        .expect("state builds")
+    }
+
+    fn test_session(token: &str) -> AuthenticatedSession {
+        AuthenticatedSession {
+            base_url: String::new(),
+            email: "alice@example.com".into(),
+            token: token.into(),
+            expires_at: Some((Utc::now() + Duration::hours(2)).to_rfc3339()),
+        }
+    }
+
+    fn test_refresh_grant() -> RefreshGrant {
+        RefreshGrant {
+            client_hash: token_hash(TEST_CLIENT),
+            scope: DEFAULT_SCOPE.into(),
+            email: "alice@example.com".into(),
+            token: "alice-session".into(),
+            session_expires_at: None,
+            // Whole seconds: the sealed form keeps expiry to the second.
+            expires_at: DateTime::from_timestamp((Utc::now() + Duration::hours(2)).timestamp(), 0)
+                .unwrap(),
+            family: "family-1".into(),
+            generation: 1,
+        }
+    }
+
+    async fn json_response(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        (status, serde_json::from_slice(&body).expect("JSON body"))
+    }
+
+    /// Issues tokens as a completed authorization would. Returns (access, refresh).
+    async fn issue_test_tokens(state: &OAuthState, session_token: &str) -> (String, String) {
+        let (status, body) = json_response(
+            issue_tokens(
+                state,
+                token_hash(TEST_CLIENT),
+                DEFAULT_SCOPE.into(),
+                test_session(session_token),
+                (random_token(16), 1),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (
+            body["access_token"].as_str().unwrap().into(),
+            body["refresh_token"].as_str().unwrap().into(),
+        )
+    }
+
+    async fn refresh_with(
+        state: &OAuthState,
+        refresh_token: &str,
+        client_id: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        json_response(
+            exchange_refresh_token(
+                state,
+                TokenForm {
+                    grant_type: "refresh_token".into(),
+                    code: None,
+                    redirect_uri: None,
+                    client_id: client_id.map(Into::into),
+                    code_verifier: None,
+                    refresh_token: Some(refresh_token.into()),
+                    resource: None,
+                },
+            )
+            .await,
+        )
+        .await
+    }
+
+    /// A Docmost that accepts every session except those in `revoked`, and
+    /// fails with 500 for `outage-session`.
+    async fn spawn_session_docmost(
+        revoked: Arc<std::sync::Mutex<HashSet<String>>>,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+        async fn me(
+            State(revoked): State<Arc<std::sync::Mutex<HashSet<String>>>>,
+            headers: HeaderMap,
+        ) -> Response {
+            let token = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .unwrap_or_default()
+                .to_string();
+            if token == "outage-session" {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            if token.is_empty() || revoked.lock().unwrap().contains(&token) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Json(json!({"data":{"user":{"email":"alice@example.com"}}})).into_response()
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let app = Router::new()
+            .route("/api/users/me", post(me))
+            .with_state(revoked);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((base, task))
+    }
+
+    #[test]
+    fn sealed_refresh_tokens_round_trip_and_reject_tampering() {
+        let state = refresh_test_state("http://docmost:3000", None);
+        let grant = test_refresh_grant();
+        let token = seal_refresh_token(&state.inner, &grant).expect("seals");
+        assert!(token.starts_with("dmr1."));
+        // Sealed, not merely encoded: the Docmost session is not readable.
+        assert!(!token.contains("alice"));
+        let decoded = URL_SAFE_NO_PAD.decode(&token[5..]).unwrap();
+        assert!(!String::from_utf8_lossy(&decoded).contains("alice-session"));
+        assert_eq!(
+            open_refresh_token(&state.inner, &token),
+            Some(grant.clone())
+        );
+        // A fresh nonce every time.
+        assert_ne!(
+            seal_refresh_token(&state.inner, &grant),
+            Some(token.clone())
+        );
+
+        // Any modified byte fails authentication.
+        let mut bytes = URL_SAFE_NO_PAD.decode(&token[5..]).unwrap();
+        for index in [0, AES_GCM_NONCE_BYTES, bytes.len() / 2, bytes.len() - 1] {
+            bytes[index] ^= 1;
+            let tampered = format!("dmr1.{}", URL_SAFE_NO_PAD.encode(&bytes));
+            assert_eq!(open_refresh_token(&state.inner, &tampered), None);
+            bytes[index] ^= 1;
+        }
+        // Truncated, malformed, wrong version, oversized.
+        assert_eq!(
+            open_refresh_token(&state.inner, &token[..token.len() - 4]),
+            None
+        );
+        assert_eq!(open_refresh_token(&state.inner, "dmr1."), None);
+        assert_eq!(open_refresh_token(&state.inner, "dmr1.!!!"), None);
+        assert_eq!(open_refresh_token(&state.inner, &token[5..]), None);
+        assert_eq!(
+            open_refresh_token(&state.inner, &token.replacen("dmr1", "dmr2", 1)),
+            None
+        );
+        assert_eq!(
+            open_refresh_token(
+                &state.inner,
+                &format!("dmr1.{}", "A".repeat(MAX_REFRESH_TOKEN_LENGTH))
+            ),
+            None
+        );
+        assert_eq!(open_refresh_token(&state.inner, ""), None);
+    }
+
+    #[test]
+    fn refresh_tokens_only_open_under_their_key_and_deployment() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let key_path = dir.path().join("refresh-token.key");
+        let state = refresh_test_state("http://docmost:3000", Some(key_path.clone()));
+        let token = seal_refresh_token(&state.inner, &test_refresh_grant()).unwrap();
+
+        // Another server's key (or the key file deleted and regenerated).
+        let other_key = refresh_test_state("http://docmost:3000", None);
+        assert_eq!(open_refresh_token(&other_key.inner, &token), None);
+        // Same key, but fronting another Docmost: the session is not for it.
+        let other_docmost = refresh_test_state("http://other-docmost:3000", Some(key_path));
+        assert_eq!(open_refresh_token(&other_docmost.inner, &token), None);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_key_persists_across_restarts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state/refresh-token.key");
+        let first = load_or_create_key(&path)?;
+        assert_eq!(load_or_create_key(&path)?, first);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o600
+            );
+            let parent = std::fs::metadata(path.parent().unwrap())?;
+            assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+        }
+
+        std::fs::write(&path, b"short")?;
+        assert!(load_or_create_key(&path).is_err());
+        let error = OAuthState::new(OAuthConfig {
+            public_url: "http://localhost:8787".into(),
+            docmost_base_url: "http://docmost:3000".into(),
+            brand: DEFAULT_BRAND.into(),
+            browser_url: None,
+            refresh_token_key_path: Some(path),
+            client_id_key_path: None,
+        })
+        .err()
+        .expect("a wrong-length key is a startup error");
+        assert!(error.to_string().contains("exactly 32 bytes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_rotate_and_reuse_revokes_the_family() -> anyhow::Result<()> {
+        let (docmost, task) = spawn_session_docmost(Default::default()).await?;
+        let state = refresh_test_state(&docmost, None);
+        let (_, first) = issue_test_tokens(&state, "alice-session").await;
+
+        let (status, body) = refresh_with(&state, &first, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let second = body["refresh_token"].as_str().unwrap().to_string();
+        assert_ne!(second, first);
+        let access = body["access_token"].as_str().unwrap();
+        assert_eq!(
+            state.access_session(access).await.unwrap().email,
+            "alice@example.com"
+        );
+
+        // Replaying the spent token fails, and because it means a copy is
+        // out there, the current token stops working too.
+        let (status, body) = refresh_with(&state, &first, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+        let (status, body) = refresh_with(&state, &second, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+
+        // Other authorizations are unaffected.
+        let (_, other) = issue_test_tokens(&state, "alice-session").await;
+        assert_eq!(refresh_with(&state, &other, None).await.0, StatusCode::OK);
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_token_survives_a_restart() -> anyhow::Result<()> {
+        let (docmost, task) = spawn_session_docmost(Default::default()).await?;
+        let dir = tempfile::tempdir()?;
+        let key_path = dir.path().join("refresh-token.key");
+        let before = refresh_test_state(&docmost, Some(key_path.clone()));
+        let (access, refresh) = issue_test_tokens(&before, "alice-session").await;
+        drop(before);
+
+        // A new process: no grants in memory, same key file.
+        let after = refresh_test_state(&docmost, Some(key_path));
+        assert!(after.access_session(&access).await.is_none());
+        let (status, body) = refresh_with(&after, &refresh, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let session = after
+            .access_session(body["access_token"].as_str().unwrap())
+            .await
+            .expect("new access token works");
+        assert_eq!(session.email, "alice@example.com");
+        assert_eq!(session.token, "alice-session");
+        assert_eq!(session.base_url, after.inner.docmost_base_url);
+        // Single use resumes from the first redemption after the restart.
+        assert_eq!(
+            refresh_with(&after, &refresh, Some(TEST_CLIENT)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_refresh_tokens_are_refused() -> anyhow::Result<()> {
+        let (docmost, task) = spawn_session_docmost(Default::default()).await?;
+        let state = refresh_test_state(&docmost, None);
+        let expired = seal_refresh_token(
+            &state.inner,
+            &RefreshGrant {
+                expires_at: Utc::now() - Duration::seconds(1),
+                ..test_refresh_grant()
+            },
+        )
+        .unwrap();
+        let (status, body) = refresh_with(&state, &expired, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_are_bound_to_their_client() -> anyhow::Result<()> {
+        let (docmost, task) = spawn_session_docmost(Default::default()).await?;
+        let state = refresh_test_state(&docmost, None);
+        let (_, refresh) = issue_test_tokens(&state, "alice-session").await;
+        let (status, body) = refresh_with(&state, &refresh, Some("another-client")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+        // The refusal did not spend the token for its real client.
+        assert_eq!(
+            refresh_with(&state, &refresh, Some(TEST_CLIENT)).await.0,
+            StatusCode::OK
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_revalidates_the_docmost_session() -> anyhow::Result<()> {
+        let revoked = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let (docmost, task) = spawn_session_docmost(revoked.clone()).await?;
+        let state = refresh_test_state(&docmost, None);
+        let (_, alice) = issue_test_tokens(&state, "alice-session").await;
+        let (_, bob) = issue_test_tokens(&state, "bob-session").await;
+
+        // Alice signs out of Docmost: her agent is cut off at its next refresh.
+        revoked.lock().unwrap().insert("alice-session".to_string());
+        let (status, body) = refresh_with(&state, &alice, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+        assert_eq!(
+            refresh_with(&state, &bob, Some(TEST_CLIENT)).await.0,
+            StatusCode::OK
+        );
+
+        // An outage is not a revocation: Docmost still checks the session on
+        // every tool call, so refresh goes ahead.
+        let (_, outage) = issue_test_tokens(&state, "outage-session").await;
+        assert_eq!(
+            refresh_with(&state, &outage, Some(TEST_CLIENT)).await.0,
+            StatusCode::OK
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoking_a_session_revokes_its_refresh_families() -> anyhow::Result<()> {
+        let revoked = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let (docmost, task) = spawn_session_docmost(revoked.clone()).await?;
+        let state = refresh_test_state(&docmost, None);
+        let (alice_access, alice) = issue_test_tokens(&state, "alice-session").await;
+        let (_, bob) = issue_test_tokens(&state, "bob-session").await;
+
+        // A tool call saw Docmost reject Alice's session. Even though Docmost
+        // would now answer for it (the check is not what stops this), her
+        // sealed refresh token is dead for the life of the process.
+        state
+            .revoke_session(&OAuthState::session_fingerprint(&test_session(
+                "alice-session",
+            )))
+            .await;
+        assert!(state.access_session(&alice_access).await.is_none());
+        let (status, body) = refresh_with(&state, &alice, Some(TEST_CLIENT)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_grant");
+        assert_eq!(
+            refresh_with(&state, &bob, Some(TEST_CLIENT)).await.0,
+            StatusCode::OK
+        );
+
+        // A rejection discovered at refresh revokes the same way: the
+        // session's live access tokens go too.
+        let (carol_access, carol) = issue_test_tokens(&state, "carol-session").await;
+        revoked.lock().unwrap().insert("carol-session".to_string());
+        assert_eq!(
+            refresh_with(&state, &carol, Some(TEST_CLIENT)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.access_session(&carol_access).await.is_none());
+        task.abort();
+        Ok(())
     }
 }
