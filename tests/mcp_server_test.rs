@@ -2,15 +2,15 @@ use anyhow::Result;
 use docmost_mcp::{server::DocmostMcpServer, types::StartupConfig};
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
 };
 
 #[derive(Debug, Clone, Default)]
 struct DummyClientHandler;
 
 impl ClientHandler for DummyClientHandler {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 
