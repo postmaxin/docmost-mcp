@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -62,6 +63,12 @@ pub struct OAuthConfig {
     pub brand: String,
     /// Public Docmost origin, with /oauth/* forwarded to this server.
     pub browser_url: Option<String>,
+    /// File holding the key that signs client_ids, created on first start.
+    /// Persisting it keeps issued client_ids valid across restarts: clients
+    /// cache their client_id and go straight to /oauth/authorize, so a new
+    /// key would strand them on an `invalid_client` page. None generates a
+    /// key per process (tests).
+    pub client_id_key_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -75,8 +82,7 @@ struct OAuthInner {
     resource_url: String,
     docmost_base_url: String,
     brand: String,
-    /// Signs client_ids. Generated at startup: a restart already drops every
-    /// grant, so clients re-register then anyway.
+    /// Signs client_ids (see OAuthConfig::client_id_key_path).
     client_id_key: [u8; 32],
     pending: RwLock<HashMap<String, PendingAuthorization>>,
     completed: RwLock<HashMap<String, CompletedAuthorization>>,
@@ -219,10 +225,9 @@ impl OAuthState {
                 public_url,
                 docmost_base_url: normalize_base_url(&config.docmost_base_url),
                 brand: normalize_brand(&config.brand),
-                client_id_key: {
-                    let mut key = [0_u8; 32];
-                    OsRng.fill_bytes(&mut key);
-                    key
+                client_id_key: match &config.client_id_key_path {
+                    Some(path) => load_or_create_client_id_key(path)?,
+                    None => random_key(),
                 },
                 pending: RwLock::new(HashMap::new()),
                 completed: RwLock::new(HashMap::new()),
@@ -1173,6 +1178,64 @@ fn random_token(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(value)
 }
 
+fn random_key() -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    OsRng.fill_bytes(&mut key);
+    key
+}
+
+/// Reads the 32-byte client_id key, creating it (mode 0600, directory 0700)
+/// if absent. Creation is exclusive, so concurrent first starts agree on one
+/// key.
+fn load_or_create_client_id_key(path: &Path) -> anyhow::Result<[u8; 32]> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            return bytes.try_into().map_err(|bytes: Vec<u8>| {
+                anyhow::anyhow!(
+                    "{} must hold exactly 32 bytes (found {}); delete it to generate a new key",
+                    path.display(),
+                    bytes.len()
+                )
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    }
+
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    let key = random_key();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(&key)
+                .and_then(|()| file.sync_all())
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            Ok(key)
+        }
+        // Another process created it first: use theirs.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_or_create_client_id_key(path)
+        }
+        Err(error) => Err(error).with_context(|| format!("Failed to create {}", path.display())),
+    }
+}
+
 /// `dmc1.<base64url JSON metadata>.<base64url HMAC-SHA256 of the first two
 /// parts>`. None when the metadata exceeds MAX_CLIENT_METADATA_BYTES.
 fn issue_client_id(key: &[u8; 32], client: &RegisteredClient) -> Option<String> {
@@ -1434,6 +1497,34 @@ mod tests {
     }
 
     #[test]
+    fn client_id_key_persists_across_restarts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state/client-id.key");
+        let first = load_or_create_client_id_key(&path)?;
+        let client_id = issue_client_id(&first, &test_client()).unwrap();
+
+        // A restart reads the same key, so the cached client_id still works.
+        let second = load_or_create_client_id_key(&path)?;
+        assert_eq!(first, second);
+        assert_eq!(decode_client_id(&second, &client_id), Some(test_client()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o600
+            );
+            let parent = std::fs::metadata(path.parent().unwrap())?;
+            assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+        }
+
+        std::fs::write(&path, b"short")?;
+        assert!(load_or_create_client_id_key(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn oversized_client_metadata_is_refused() {
         let client = RegisteredClient {
             redirect_uris: (0..10)
@@ -1453,6 +1544,7 @@ mod tests {
             docmost_base_url: "http://127.0.0.1:9".into(),
             brand: DEFAULT_BRAND.into(),
             browser_url: None,
+            client_id_key_path: None,
         })?;
         let router = state.clone().routes();
         let server = tokio::spawn(async move {
@@ -1572,6 +1664,7 @@ mod tests {
             docmost_base_url: format!("http://{address}"),
             brand: DEFAULT_BRAND.to_string(),
             browser_url: Some(base.clone()),
+            client_id_key_path: None,
         })?;
         let server = {
             let router = state.clone().routes();
@@ -1717,6 +1810,7 @@ mod tests {
             docmost_base_url: "http://docmost:3000".into(),
             brand: DEFAULT_BRAND.into(),
             browser_url: Some("https://docs.example.com".into()),
+            client_id_key_path: None,
         })
         .unwrap();
         let mut headers = HeaderMap::new();
@@ -1741,6 +1835,7 @@ mod tests {
             docmost_base_url: "http://localhost:3000".to_string(),
             brand: DEFAULT_BRAND.to_string(),
             browser_url: None,
+            client_id_key_path: None,
         })
         .expect("state builds");
 
@@ -1795,6 +1890,7 @@ mod tests {
             docmost_base_url: format!("http://{docmost_address}"),
             brand: DEFAULT_BRAND.to_string(),
             browser_url: None,
+            client_id_key_path: None,
         })?;
         let oauth_task = {
             let app = oauth_state.clone().routes();
