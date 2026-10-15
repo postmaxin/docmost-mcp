@@ -27,6 +27,12 @@ throttling, one-time authorization codes, and opaque tokens stored only as
 SHA-256 hashes. Grants live in memory, so a restart requires users to sign in
 again — deliberately.
 
+Each grant carries the Docmost session captured at consent, and lives no longer
+than that session. Once Docmost rejects it (the user signed out, the session was
+revoked, or it expired), the server drops every access token, refresh token, and
+unredeemed code carrying it, and `/mcp` answers 401 with the OAuth challenge so
+the client signs in again. A refresh also checks the session with Docmost first.
+
 ## Supported boundary
 
 The default configuration is for a single machine: loopback HTTP, exact Host and

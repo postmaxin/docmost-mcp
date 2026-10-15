@@ -284,6 +284,66 @@ impl OAuthState {
         );
         active
     }
+
+    /// Invalidate every grant that carries the Docmost session with this
+    /// fingerprint: access tokens, refresh tokens, and unredeemed codes.
+    ///
+    /// Called once Docmost rejects the session (logout, revocation, expiry).
+    /// The client then gets a 401 from `/mcp`, its refresh is refused, and it
+    /// falls back to a fresh authorization, which captures a new session.
+    pub async fn revoke_session(&self, fingerprint: &str) {
+        let carries = |session: &AuthenticatedSession| {
+            constant_time_equal(&Self::session_fingerprint(session), fingerprint)
+        };
+        self.inner
+            .access_tokens
+            .write()
+            .await
+            .retain(|_, grant| !carries(&grant.session));
+        self.inner
+            .refresh_tokens
+            .write()
+            .await
+            .retain(|_, grant| !carries(&grant.session));
+        self.inner
+            .codes
+            .write()
+            .await
+            .retain(|_, grant| !carries(&grant.session));
+    }
+}
+
+#[cfg(test)]
+impl OAuthState {
+    /// Issue an access and refresh token for `session` without the browser flow.
+    pub(crate) async fn issue_tokens_for_test(
+        &self,
+        client_id: &str,
+        session: AuthenticatedSession,
+    ) -> (String, String) {
+        let response = issue_tokens(
+            self,
+            client_id.to_string(),
+            DEFAULT_SCOPE.to_string(),
+            session,
+            true,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token response body");
+        let tokens: serde_json::Value = serde_json::from_slice(&body).expect("token JSON");
+        (
+            tokens["access_token"]
+                .as_str()
+                .expect("access token")
+                .into(),
+            tokens["refresh_token"]
+                .as_str()
+                .expect("refresh token")
+                .into(),
+        )
+    }
 }
 
 async fn protected_resource_metadata(State(state): State<OAuthState>) -> Json<serde_json::Value> {
@@ -749,8 +809,40 @@ async fn exchange_refresh_token(state: &OAuthState, form: TokenForm) -> Response
             "Docmost session expired; sign in again.",
         );
     }
+    // A refresh is the one point a client asks for new credentials without
+    // touching Docmost, so check the session here rather than minting fresh
+    // tokens for one Docmost has already revoked.
+    if docmost_rejects_session(&grant.session).await {
+        state
+            .revoke_session(&OAuthState::session_fingerprint(&grant.session))
+            .await;
+        return oauth_json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Docmost rejected this account session; sign in again.",
+        );
+    }
 
     issue_tokens(state, grant.client_id, grant.scope, grant.session, true).await
+}
+
+/// True only when Docmost explicitly answers 401 for this session. A network
+/// failure is not proof of revocation; the next tool call would surface a real
+/// rejection anyway.
+async fn docmost_rejects_session(session: &AuthenticatedSession) -> bool {
+    let Ok(http) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    else {
+        return false;
+    };
+    http.post(format!("{}/api/users/me", session.base_url))
+        .bearer_auth(&session.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
 }
 
 async fn issue_tokens(
