@@ -117,6 +117,15 @@ DOCMOST_MCP_ALLOWED_HOSTS=mcp.example.com,docs.example.com
 DOCMOST_MCP_ALLOWED_ORIGINS=https://mcp.example.com,https://docs.example.com
 ```
 
+A connection never outlives the Docmost session it was granted from: refresh
+tokens expire with that session. Consent normally reuses the browser's
+current session, so a session signed in six days ago yields a connection
+that ends a day later. To avoid that, set `DOCMOST_MCP_MIN_SESSION_REMAINING`
+(e.g. `6d23h` with Docmost's `JWT_TOKEN_EXPIRES_IN=7d`). A session with less
+time left is not offered for consent; the page asks the user to sign in
+again, which gives the browser, and the connection, a full-length session.
+Keep it below Docmost's session lifetime, or no session ever qualifies.
+
 Without `DOCMOST_MCP_BROWSER_URL`, the existing credential relay remains
 available for deployments that cannot route OAuth on the Docmost origin.
 Use the generic OSS image for personal deployments; a company-branded image
@@ -186,6 +195,7 @@ See [SECURITY.md](SECURITY.md) for deployment boundaries and how to report issue
 | `DOCMOST_MCP_ACCOUNT_AUTH` | `false` | Enables per-account browser login and OAuth discovery |
 | `DOCMOST_MCP_PUBLIC_URL` | — | Public HTTPS origin; required when account auth is enabled |
 | `DOCMOST_MCP_BRAND` | `Docmost` | Product name on the sign-in pages, for rebranded deployments |
+| `DOCMOST_MCP_MIN_SESSION_REMAINING` | unset | Browser login: least lifetime (e.g. `6d23h`) a Docmost session needs to be offered for consent; shorter ones must sign in again |
 | `DOCMOST_MCP_BIND` | `127.0.0.1:8787` | HTTP listen address |
 | `DOCMOST_MCP_ALLOWED_HOSTS` | loopback | Comma-separated Host allowlist |
 | `DOCMOST_MCP_ALLOWED_ORIGINS` | loopback | Comma-separated browser Origin allowlist |

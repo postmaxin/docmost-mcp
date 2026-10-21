@@ -20,7 +20,7 @@ use tower::ServiceExt;
 
 use crate::{
     auth::manager::SessionRejectedHook,
-    oauth::{DEFAULT_BRAND, OAuthConfig, OAuthState},
+    oauth::{DEFAULT_BRAND, OAuthConfig, OAuthState, parse_duration},
     server::DocmostMcpServer,
     types::{AuthenticatedSession, StartupConfig},
 };
@@ -121,6 +121,12 @@ impl HttpServerConfig {
                 client_id_key_path: Some(client_id_key_path()?),
                 refresh_token_key_path: Some(refresh_token_key_path()?),
                 brand: env::var("DOCMOST_MCP_BRAND").unwrap_or_else(|_| DEFAULT_BRAND.to_string()),
+                min_session_remaining: env::var("DOCMOST_MCP_MIN_SESSION_REMAINING")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| parse_duration(&value))
+                    .transpose()
+                    .context("DOCMOST_MCP_MIN_SESSION_REMAINING")?,
             })
         } else {
             None
@@ -696,6 +702,7 @@ mod tests {
                     brand: DEFAULT_BRAND.to_string(),
                     client_id_key_path: None,
                     refresh_token_key_path: None,
+                    min_session_remaining: None,
                 }),
             },
         )?;
