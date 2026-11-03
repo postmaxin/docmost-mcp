@@ -53,7 +53,9 @@ generate every byte as output. It needs the HTTP transport with
 1. The call is a write like any other: default-deny, `confirm: true`, and audited as
    `begin_upload`. It returns a single-use URL, `{DOCMOST_MCP_PUBLIC_URL}/uploads/{token}`.
 2. The client sends the raw file there with one `PUT`, for example
-   `curl -fsS -T chart.png '<url>'`.
+   `curl -sS --fail-with-body -T chart.png '<url>'`. Keep the error body (don't use
+   plain `-f`): on failure its `uploaded` field says whether anything may have been
+   stored.
 3. The server checks the body is exactly `size` bytes with the declared SHA-256. Only
    then does it upload to Docmost as the session that began the upload (pinned when the
    upload is approved, so it can't switch accounts in between), auditing it as

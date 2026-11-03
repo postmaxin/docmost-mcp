@@ -29,7 +29,7 @@ impl DocmostMcpServer {
         description = "Start uploading a file to a Docmost page without sending its bytes \
                        through the conversation. Give the file's exact size and SHA-256 (for \
                        example from `sha256sum`). Returns a single-use URL; send the raw file \
-                       to it with one HTTP PUT, such as `curl -fsS -T <file> '<url>'`. The \
+                       to it with one HTTP PUT, such as `curl -sS --fail-with-body -T <file> '<url>'`. The \
                        server uploads it only if the size and hash match, and the PUT \
                        response gives the attachment ID, its `/api/files/...` path and a \
                        Markdown snippet. Uploading does not change the page body; to show \
@@ -103,11 +103,13 @@ impl DocmostMcpServer {
         Ok(format!(
             "Ready for \"{name}\" ({size} bytes, {mime_type}). Send the file with one HTTP PUT \
              within {minutes} minutes; the URL works once:\n\n\
-             curl -fsS -T <file> '{url}'\n\n\
+             curl -sS --fail-with-body -T <file> '{url}'\n\n\
              Nothing is uploaded unless the body is exactly {size} bytes with SHA-256 {hash}. \
              The PUT response is JSON with the attachment ID, its `path` and a ready-made \
-             `markdown` snippet for docmost_update_page. If it reports a mismatch, the URL is \
-             used up: call docmost_begin_upload again.",
+             `markdown` snippet for docmost_update_page. On failure, read the JSON: \
+             `\"uploaded\": false` means nothing was stored and the URL is used up, so call \
+             docmost_begin_upload again; `\"uploaded\": null` means Docmost may have stored \
+             the file, so check the page's attachments before uploading again.",
             name = input.file_name,
             minutes = begun.expires_in.as_secs().div_ceil(60),
             url = begun.url,
