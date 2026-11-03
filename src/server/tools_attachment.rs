@@ -109,7 +109,8 @@ impl DocmostMcpServer {
              `markdown` snippet for docmost_update_page. On failure, read the JSON: \
              `\"uploaded\": false` means nothing was stored and the URL is used up, so call \
              docmost_begin_upload again; `\"uploaded\": null` means Docmost may have stored \
-             the file, so check the page's attachments before uploading again.",
+             the file, so check the page's attachments before uploading again. If the PUT \
+             gets no response at all, check the page's attachments before starting again.",
             name = input.file_name,
             minutes = begun.expires_in.as_secs().div_ceil(60),
             url = begun.url,

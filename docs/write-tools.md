@@ -55,7 +55,8 @@ generate every byte as output. It needs the HTTP transport with
 2. The client sends the raw file there with one `PUT`, for example
    `curl -sS --fail-with-body -T chart.png '<url>'`. Keep the error body (don't use
    plain `-f`): on failure its `uploaded` field says whether anything may have been
-   stored.
+   stored. If the `PUT` gets no response at all, check the page's attachments before
+   starting again.
 3. The server checks the body is exactly `size` bytes with the declared SHA-256. Only
    then does it upload to Docmost as the session that began the upload (pinned when the
    upload is approved, so it can't switch accounts in between), auditing it as
