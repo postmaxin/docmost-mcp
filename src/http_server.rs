@@ -22,6 +22,7 @@ use crate::{
     auth::manager::SessionRejectedHook,
     oauth::{DEFAULT_BRAND, OAuthConfig, OAuthState, parse_duration},
     server::DocmostMcpServer,
+    staged_upload::{self, DEFAULT_MAX_STAGED_BYTES, UploadStager},
     types::{AuthenticatedSession, StartupConfig},
 };
 
@@ -59,6 +60,7 @@ struct AppState {
     user_services: Arc<RwLock<HashMap<String, McpService>>>,
     mcp_config: StreamableHttpServerConfig,
     oauth: Option<OAuthState>,
+    stager: Option<UploadStager>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +70,11 @@ pub struct HttpServerConfig {
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub oauth: Option<OAuthConfig>,
+    /// This server's externally reachable base URL (`DOCMOST_MCP_PUBLIC_URL`). Staged
+    /// uploads are offered only when it is set, since their URLs are built under it.
+    pub public_url: Option<String>,
+    /// Largest staged upload accepted, in bytes (`DOCMOST_MCP_MAX_UPLOAD_BYTES`).
+    pub max_staged_upload_bytes: usize,
 }
 
 impl HttpServerConfig {
@@ -131,6 +138,13 @@ impl HttpServerConfig {
         } else {
             None
         };
+        let public_url = staged_upload_public_url(env::var("DOCMOST_MCP_PUBLIC_URL").ok());
+        let max_staged_upload_bytes = match env::var("DOCMOST_MCP_MAX_UPLOAD_BYTES") {
+            Ok(value) => value.trim().parse::<usize>().ok().filter(|n| *n > 0).with_context(|| {
+                format!("DOCMOST_MCP_MAX_UPLOAD_BYTES must be a positive number of bytes, got {value:?}")
+            })?,
+            Err(_) => DEFAULT_MAX_STAGED_BYTES,
+        };
         if bearer_token.is_none() && oauth.is_none() {
             bail!(
                 "Set DOCMOST_MCP_BEARER_TOKEN or enable per-account auth with DOCMOST_MCP_ACCOUNT_AUTH=true"
@@ -143,6 +157,8 @@ impl HttpServerConfig {
             allowed_hosts,
             allowed_origins,
             oauth,
+            public_url,
+            max_staged_upload_bytes,
         })
     }
 }
@@ -175,6 +191,23 @@ fn refresh_token_key_path() -> Result<std::path::PathBuf> {
     Ok(dirs::home_dir()
         .context("Unable to determine home directory for the refresh-token key")?
         .join(".docmost-local-mcp/refresh-token.key"))
+}
+
+/// The base for staged-upload URLs. It goes through the same origin validation as account
+/// auth, so a token and file are never sent over plain HTTP outside localhost and the URL
+/// has no path, query or fragment to break `/uploads/{token}`. Account auth already fails
+/// startup on an invalid value; in bearer-only mode the variable was unused before staged
+/// uploads, so an invalid value turns them off with a warning rather than refusing to
+/// start a working deployment.
+fn staged_upload_public_url(raw: Option<String>) -> Option<String> {
+    let raw = raw.filter(|value| !value.trim().is_empty())?;
+    match crate::oauth::normalize_public_url(raw.trim()) {
+        Ok(url) => Some(url),
+        Err(error) => {
+            tracing::warn!(%error, "DOCMOST_MCP_PUBLIC_URL is not a valid public origin; staged uploads are disabled");
+            None
+        }
+    }
 }
 
 fn comma_separated_env(name: &str) -> Option<Vec<String>> {
@@ -214,8 +247,17 @@ fn build_app(
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(config.allowed_hosts)
         .with_allowed_origins(config.allowed_origins);
+    let stager = config
+        .public_url
+        .as_deref()
+        .map(|url| UploadStager::new(url, config.max_staged_upload_bytes));
+    let admin_stager = stager.clone();
     let admin_service = StreamableHttpService::new(
-        move || DocmostMcpServer::new(startup_config.clone()).map_err(std::io::Error::other),
+        move || {
+            DocmostMcpServer::new(startup_config.clone())
+                .map(|server| server.with_stager(admin_stager.clone()))
+                .map_err(std::io::Error::other)
+        },
         LocalSessionManager::default().into(),
         mcp_config.clone(),
     );
@@ -228,6 +270,7 @@ fn build_app(
         user_services: Arc::new(RwLock::new(HashMap::new())),
         mcp_config,
         oauth: oauth.clone(),
+        stager: stager.clone(),
     };
 
     let mut router = Router::new()
@@ -237,6 +280,9 @@ fn build_app(
         .with_state(state);
     if let Some(oauth) = oauth.clone() {
         router = router.merge(oauth.routes());
+    }
+    if let Some(stager) = stager {
+        router = router.merge(staged_upload::routes(stager));
     }
     Ok((router, oauth))
 }
@@ -275,7 +321,12 @@ async fn handle_mcp(State(state): State<AppState>, request: Request<Body>) -> Re
                 .entry(key.clone())
                 .or_insert_with(|| {
                     let on_rejected = session_rejected_hook(&state, oauth, key);
-                    user_mcp_service(session, on_rejected, state.mcp_config.clone())
+                    user_mcp_service(
+                        session,
+                        on_rejected,
+                        state.mcp_config.clone(),
+                        state.stager.clone(),
+                    )
                 })
                 .clone()
         };
@@ -316,10 +367,12 @@ fn user_mcp_service(
     session: AuthenticatedSession,
     on_rejected: SessionRejectedHook,
     config: StreamableHttpServerConfig,
+    stager: Option<UploadStager>,
 ) -> McpService {
     StreamableHttpService::new(
         move || {
             DocmostMcpServer::new_with_session(session.clone(), on_rejected.clone())
+                .map(|server| server.with_stager(stager.clone()))
                 .map_err(std::io::Error::other)
         },
         LocalSessionManager::default().into(),
@@ -455,6 +508,31 @@ mod tests {
     use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN};
 
     #[test]
+    fn staged_upload_public_url_requires_a_valid_https_origin() {
+        let url = |value: &str| staged_upload_public_url(Some(value.to_string()));
+        assert_eq!(
+            url("https://mcp.example.com/").as_deref(),
+            Some("https://mcp.example.com")
+        );
+        assert_eq!(
+            url("http://127.0.0.1:8787").as_deref(),
+            Some("http://127.0.0.1:8787")
+        );
+        assert_eq!(staged_upload_public_url(None), None);
+        assert_eq!(url("  "), None);
+        for bad in [
+            "http://mcp.example.com",
+            "https://mcp.example.com/base",
+            "https://mcp.example.com/?x=1",
+            "https://mcp.example.com/#frag",
+            "https://user:pw@mcp.example.com",
+            "not a url",
+        ] {
+            assert_eq!(url(bad), None, "{bad:?} must not enable staged uploads");
+        }
+    }
+
+    #[test]
     fn parses_comma_separated_values() {
         unsafe { env::set_var("DOCMOST_MCP_TEST_LIST", " a.example, b.example ") };
         assert_eq!(
@@ -490,6 +568,8 @@ mod tests {
                 allowed_hosts: vec![address.to_string()],
                 allowed_origins: vec![format!("http://{address}")],
                 oauth: None,
+                public_url: None,
+                max_staged_upload_bytes: DEFAULT_MAX_STAGED_BYTES,
             },
         )?;
         let task = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -704,6 +784,8 @@ mod tests {
                     refresh_token_key_path: None,
                     min_session_remaining: None,
                 }),
+                public_url: None,
+                max_staged_upload_bytes: DEFAULT_MAX_STAGED_BYTES,
             },
         )?;
         let oauth = oauth.expect("account auth is enabled");

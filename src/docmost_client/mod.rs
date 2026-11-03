@@ -99,6 +99,7 @@ impl<T> Page<T> {
 }
 
 mod attachments;
+pub use attachments::{UploadOutcomeUnknown, is_outcome_unknown};
 mod writes;
 
 impl DocmostClient {
@@ -108,6 +109,19 @@ impl DocmostClient {
             http: Client::new(),
             version: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// A copy of this client fixed to the session it would use right now. The copy can
+    /// neither switch accounts nor reauthenticate, so work approved now can't later run
+    /// as a different account, for example when a server on saved credentials signs in
+    /// again as someone else before a staged upload arrives.
+    pub async fn pinned(&self) -> Result<Self> {
+        let session = self.auth_manager.get_authenticated_session().await?;
+        Ok(Self {
+            auth_manager: AuthManager::from_session(session)?,
+            http: self.http.clone(),
+            version: self.version.clone(),
+        })
     }
 
     /// The detected Docmost server version (from `POST /api/version`). Fetched once and

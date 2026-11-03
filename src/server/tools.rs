@@ -63,6 +63,7 @@ impl DocmostMcpServer {
                 std::env::var("DOCMOST_MCP_ENABLE_WRITES").ok().as_deref(),
                 Some("1") | Some("true")
             ),
+            stager: None,
         })
     }
 

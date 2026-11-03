@@ -7,7 +7,7 @@ use rmcp::{
     tool_handler,
 };
 
-use crate::docmost_client::DocmostClient;
+use crate::{docmost_client::DocmostClient, staged_upload::UploadStager};
 
 mod render;
 mod tools;
@@ -15,11 +15,15 @@ mod tools_attachment;
 mod tools_page_write;
 mod tools_write;
 
+pub(crate) use tools_attachment::{attachment_markdown, attachment_path};
+
 #[derive(Debug, Clone)]
 pub struct DocmostMcpServer {
     client: DocmostClient,
     tool_router: ToolRouter<Self>,
     writes_enabled: bool,
+    /// Present only over HTTP with a public URL; see [`crate::staged_upload`].
+    stager: Option<UploadStager>,
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -42,6 +46,12 @@ fn internal_error(error: anyhow::Error) -> ErrorData {
 }
 
 impl DocmostMcpServer {
+    /// Enable `docmost_begin_upload` by sharing the HTTP server's pending-upload store.
+    pub fn with_stager(mut self, stager: Option<UploadStager>) -> Self {
+        self.stager = stager;
+        self
+    }
+
     pub(crate) async fn run_write<T, F>(
         &self,
         confirmed: bool,
