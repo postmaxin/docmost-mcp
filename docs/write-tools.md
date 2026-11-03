@@ -87,14 +87,19 @@ model. It needs the HTTP transport with `DOCMOST_MCP_PUBLIC_URL` set.
 2. The client sends the raw file there with one `PUT`, for example
    `curl -fsS -T chart.png '<url>'`.
 3. The server checks the body is exactly `size` bytes with the declared SHA-256. Only
-   then does it upload to Docmost as the session that began the upload, auditing it as
+   then does it upload to Docmost as the session that began the upload (pinned when the
+   upload is approved, so it can't switch accounts in between), auditing it as
    `upload_attachment` (`authorized`, then `succeeded` or `failed`). The response is
    JSON with the attachment ID, its `path`, and a `markdown` snippet.
 
 The URL is the credential, so the route needs no bearer token. Its token is 256 random
 bits, stored only as a hash, bound to one page, file name, MIME type, size and SHA-256,
 usable once, and valid for 10 minutes. Any request uses it up, including one whose body
-is refused, so a failed attempt needs a new `docmost_begin_upload`. The body streams to
+is refused, so a failed attempt needs a new `docmost_begin_upload`. Two cases don't use
+it up: when too many uploads are already in progress (four at once), the server answers
+`503` and the URL can be retried. A body that hasn't fully arrived within 10 minutes is
+refused with `408`. `DOCMOST_MCP_PUBLIC_URL` must be an `https://` origin outside
+localhost; otherwise staged uploads are turned off with a warning. The body streams to
 this server rather than through the JSON-RPC transport, so the limit is
 `DOCMOST_MCP_MAX_UPLOAD_BYTES` (50 MiB by default) rather than 2 MiB. Docmost's own
 `FILE_UPLOAD_SIZE_LIMIT` still applies.

@@ -1122,7 +1122,7 @@ fn hardened_auth_response(mut response: Response) -> Response {
     response
 }
 
-fn normalize_public_url(value: &str) -> anyhow::Result<String> {
+pub(crate) fn normalize_public_url(value: &str) -> anyhow::Result<String> {
     let parsed = Url::parse(value)?;
     if parsed.scheme() != "https" && !is_loopback_host(parsed.host_str()) {
         anyhow::bail!("DOCMOST_MCP_PUBLIC_URL must use HTTPS outside localhost");

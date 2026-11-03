@@ -40,6 +40,8 @@ struct CapturedState {
     upload_attempts: Arc<AtomicUsize>,
     /// Raw multipart bodies sent to the attachment upload endpoint (may be binary).
     upload_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The `Authorization` header of each upload, to show which session sent it.
+    upload_auth: Arc<Mutex<Vec<String>>>,
     /// When true, the upload route wraps its reply in a `{ data }` envelope.
     envelope_upload: Arc<AtomicBool>,
     /// How many times the mock `/api/auth/login` endpoint was called.
@@ -219,6 +221,13 @@ async fn upload_route(
         "upload must be multipart, got: {content_type}"
     );
     state.upload_bodies.lock().unwrap().push(body.to_vec());
+    state.upload_auth.lock().unwrap().push(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+    );
     let attachment = json!({
         "id": "0199aaaa-0000-7000-8000-000000000001",
         "fileName": "diagram.png",
@@ -709,18 +718,16 @@ async fn upload_attachment_resolves_a_slug_to_the_page_uuid() -> Result<()> {
 
 const MCP_PUBLIC_URL: &str = "http://mcp.example";
 
-/// The upload route audits every write. Point the log at one temp file for the whole
-/// test binary, since tests run in parallel and the variable is process-wide.
+/// The upload route audits every write. Point the log at one file for the whole test
+/// binary, since tests run in parallel and the variable is process-wide. The file sits in
+/// its own temporary directory, because the audit logger sets the log's parent to 0700:
+/// putting it straight in the system temp directory would try to chmod `/tmp` itself.
 fn use_test_audit_log() {
+    static AUDIT_DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    let dir = AUDIT_DIR.get_or_init(|| TempDir::new().expect("audit temp dir"));
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let path = std::env::temp_dir().join(format!(
-            "docmost-mcp-staged-upload-audit-{}.jsonl",
-            std::process::id()
-        ));
-        unsafe {
-            std::env::set_var("DOCMOST_MCP_AUDIT_LOG", path);
-        }
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("DOCMOST_MCP_AUDIT_LOG", dir.path().join("mutations.jsonl"));
     });
 }
 
@@ -882,5 +889,131 @@ async fn staged_upload_url_expires() -> Result<()> {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(stager.pending_count().await, 0);
     assert!(state.upload_bodies.lock().unwrap().is_empty());
+    Ok(())
+}
+
+/// A body that sends two bytes and then never finishes, like a stalled `curl`.
+fn stalled_body() -> Body {
+    use futures::StreamExt;
+    let start = futures::stream::once(async {
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(&PNG_ISH[..2]))
+    });
+    Body::from_stream(start.chain(futures::stream::pending()))
+}
+
+#[tokio::test]
+async fn staged_upload_gives_up_on_a_body_that_stalls() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::new(MCP_PUBLIC_URL, 1024)
+        .with_read_deadline(std::time::Duration::from_millis(50));
+    let url = stager
+        .begin(
+            client,
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+        .await?
+        .url;
+    let app = staged_upload_routes(stager.clone());
+    let path = url.strip_prefix(MCP_PUBLIC_URL).unwrap().to_string();
+
+    let response = app
+        .clone()
+        .oneshot(Request::put(path.as_str()).body(stalled_body())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(state.upload_bodies.lock().unwrap().is_empty());
+    // A timed-out attempt uses the URL up, like any other refused one.
+    let (status, _) = put_to(&app, &url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_upload_refuses_when_busy_without_using_the_url_up() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::new(MCP_PUBLIC_URL, 1024)
+        .with_max_in_flight(1)
+        .with_read_deadline(std::time::Duration::from_millis(300));
+    let begin = || {
+        stager.begin(
+            client.clone(),
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+    };
+    let stalled_url = begin().await?.url;
+    let waiting_url = begin().await?.url;
+    let app = staged_upload_routes(stager.clone());
+
+    // Occupy the only slot with a body that never finishes.
+    let stalled_path = stalled_url
+        .strip_prefix(MCP_PUBLIC_URL)
+        .unwrap()
+        .to_string();
+    let holder = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::put(stalled_path.as_str())
+                    .body(stalled_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (status, body) = put_to(&app, &waiting_url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    // Once the stalled upload times out and frees its slot, the same URL still works.
+    assert_eq!(holder.await?, StatusCode::REQUEST_TIMEOUT);
+    let (status, body) = put_to(&app, &waiting_url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(state.upload_bodies.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_client_keeps_the_session_it_was_approved_with() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let pinned = client.pinned().await?;
+
+    // The server's saved session changes to another account before the upload arrives.
+    StateStore::new(Some(temp.path().to_path_buf()))?
+        .write_session(&StoredSession {
+            token: "switched-token".to_string(),
+            expires_at: None,
+            saved_at: "2026-03-12T00:00:00.000Z".to_string(),
+        })
+        .await?;
+
+    pinned
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await?;
+    client
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await?;
+    let auth = state.upload_auth.lock().unwrap().clone();
+    assert_eq!(
+        auth[0], "Bearer seed-token",
+        "the pinned client must not switch accounts"
+    );
+    // The unpinned client does follow the saved session, which is what pinning guards against.
+    assert_eq!(auth[1], "Bearer switched-token");
     Ok(())
 }

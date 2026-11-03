@@ -110,6 +110,19 @@ impl DocmostClient {
         }
     }
 
+    /// A copy of this client fixed to the session it would use right now. The copy can
+    /// neither switch accounts nor reauthenticate, so work approved now can't later run
+    /// as a different account, for example when a server on saved credentials signs in
+    /// again as someone else before a staged upload arrives.
+    pub async fn pinned(&self) -> Result<Self> {
+        let session = self.auth_manager.get_authenticated_session().await?;
+        Ok(Self {
+            auth_manager: AuthManager::from_session(session)?,
+            http: self.http.clone(),
+            version: self.version.clone(),
+        })
+    }
+
     /// The detected Docmost server version (from `POST /api/version`). Fetched once and
     /// cached **only on success**, so a transient probe failure doesn't poison the session
     /// (a later call re-probes). `None` if the endpoint is unavailable (e.g. Docmost Cloud)

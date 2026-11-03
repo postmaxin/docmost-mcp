@@ -125,10 +125,7 @@ impl HttpServerConfig {
         } else {
             None
         };
-        let public_url = env::var("DOCMOST_MCP_PUBLIC_URL")
-            .ok()
-            .map(|url| url.trim().trim_end_matches('/').to_string())
-            .filter(|url| !url.is_empty());
+        let public_url = staged_upload_public_url(env::var("DOCMOST_MCP_PUBLIC_URL").ok());
         let max_staged_upload_bytes = match env::var("DOCMOST_MCP_MAX_UPLOAD_BYTES") {
             Ok(value) => value.trim().parse::<usize>().ok().filter(|n| *n > 0).with_context(|| {
                 format!("DOCMOST_MCP_MAX_UPLOAD_BYTES must be a positive number of bytes, got {value:?}")
@@ -150,6 +147,23 @@ impl HttpServerConfig {
             public_url,
             max_staged_upload_bytes,
         })
+    }
+}
+
+/// The base for staged-upload URLs. It goes through the same origin validation as account
+/// auth, so a token and file are never sent over plain HTTP outside localhost and the URL
+/// has no path, query or fragment to break `/uploads/{token}`. Account auth already fails
+/// startup on an invalid value; in bearer-only mode the variable was unused before staged
+/// uploads, so an invalid value turns them off with a warning rather than refusing to
+/// start a working deployment.
+fn staged_upload_public_url(raw: Option<String>) -> Option<String> {
+    let raw = raw.filter(|value| !value.trim().is_empty())?;
+    match crate::oauth::normalize_public_url(raw.trim()) {
+        Ok(url) => Some(url),
+        Err(error) => {
+            tracing::warn!(%error, "DOCMOST_MCP_PUBLIC_URL is not a valid public origin; staged uploads are disabled");
+            None
+        }
     }
 }
 
@@ -314,6 +328,31 @@ fn unauthorized(state: &AppState) -> Response {
 mod tests {
     use super::*;
     use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN};
+
+    #[test]
+    fn staged_upload_public_url_requires_a_valid_https_origin() {
+        let url = |value: &str| staged_upload_public_url(Some(value.to_string()));
+        assert_eq!(
+            url("https://mcp.example.com/").as_deref(),
+            Some("https://mcp.example.com")
+        );
+        assert_eq!(
+            url("http://127.0.0.1:8787").as_deref(),
+            Some("http://127.0.0.1:8787")
+        );
+        assert_eq!(staged_upload_public_url(None), None);
+        assert_eq!(url("  "), None);
+        for bad in [
+            "http://mcp.example.com",
+            "https://mcp.example.com/base",
+            "https://mcp.example.com/?x=1",
+            "https://mcp.example.com/#frag",
+            "https://user:pw@mcp.example.com",
+            "not a url",
+        ] {
+            assert_eq!(url(bad), None, "{bad:?} must not enable staged uploads");
+        }
+    }
 
     #[test]
     fn parses_comma_separated_values() {

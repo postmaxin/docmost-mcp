@@ -139,20 +139,22 @@ impl DocmostMcpServer {
             )
         })?;
 
+        // Pin the session inside the gated step: the upload must run as the account that
+        // was approved now, not whichever account the server holds when the PUT arrives.
         let begun = self
-            .run_write(
-                input.confirm,
-                "begin_upload",
-                &input.page_id,
-                stager.begin(
-                    self.client.clone(),
-                    &input.page_id,
-                    &input.file_name,
-                    &mime_type,
-                    size,
-                    sha256,
-                ),
-            )
+            .run_write(input.confirm, "begin_upload", &input.page_id, async {
+                let client = self.client.pinned().await?;
+                stager
+                    .begin(
+                        client,
+                        &input.page_id,
+                        &input.file_name,
+                        &mime_type,
+                        size,
+                        sha256,
+                    )
+                    .await
+            })
             .await?;
         Ok(format!(
             "Ready for \"{name}\" ({size} bytes, {mime_type}). Send the file with one HTTP PUT \
