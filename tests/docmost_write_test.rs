@@ -46,6 +46,9 @@ struct CapturedState {
     envelope_upload: Arc<AtomicBool>,
     /// When true, the upload route hangs instead of answering, like a stuck Docmost.
     stall_upload: Arc<AtomicBool>,
+    /// When true, the upload route stores the file but replies with something that isn't
+    /// an attachment, like a proxy page or a truncated response.
+    garble_upload: Arc<AtomicBool>,
     /// How many times the mock `/api/auth/login` endpoint was called.
     login_hits: Arc<AtomicUsize>,
 }
@@ -244,6 +247,9 @@ async fn upload_route(
         "spaceId": "space-1",
         "url": "http://docs.example.com/api/files/0199aaaa-0000-7000-8000-000000000001/diagram.png"
     });
+    if state.garble_upload.load(Ordering::SeqCst) {
+        return (StatusCode::OK, Json(json!({ "unexpected": true })));
+    }
     if state.envelope_upload.load(Ordering::SeqCst) {
         return (
             StatusCode::OK,
@@ -691,7 +697,33 @@ async fn upload_attachment_surfaces_server_error() -> Result<()> {
         .await
         .expect_err("403 must surface as an error");
     assert!(error.to_string().contains("403"), "{error}");
+    assert!(
+        !docmost_mcp::docmost_client::is_outcome_unknown(&error),
+        "an error status is a confirmed rejection"
+    );
     assert!(state.upload_bodies.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_attachment_marks_an_unreadable_success_as_uncertain() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    state.garble_upload.store(true, Ordering::SeqCst);
+
+    let error = client
+        .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+        .await
+        .expect_err("a reply that isn't an attachment must be an error");
+    assert!(
+        docmost_mcp::docmost_client::is_outcome_unknown(&error),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("may already have stored"),
+        "{error}"
+    );
+    assert_eq!(state.upload_bodies.lock().unwrap().len(), 1);
     Ok(())
 }
 
@@ -1071,5 +1103,44 @@ async fn staged_upload_frees_its_slot_when_docmost_hangs() -> Result<()> {
     state.stall_upload.store(false, Ordering::SeqCst);
     let (status, body) = put_to(&app, &next_url, PNG_ISH.to_vec()).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_upload_reports_an_unreadable_success_as_uncertain() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::new(MCP_PUBLIC_URL, 1024);
+    let url = stager
+        .begin(
+            client.clone(),
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+        .await?
+        .url;
+    let app = staged_upload_routes(stager.clone());
+
+    state.garble_upload.store(true, Ordering::SeqCst);
+    let (status, body) = put_to(&app, &url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        body["uploaded"],
+        Value::Null,
+        "Docmost may have it, so not a failure"
+    );
+    assert!(
+        body["error"].as_str().unwrap().contains("check the page"),
+        "{body}"
+    );
+    let audit = std::fs::read_to_string(std::env::var("DOCMOST_MCP_AUDIT_LOG")?)?;
+    assert!(
+        audit.contains("\"uncertain\""),
+        "the outcome must be audited as uncertain"
+    );
     Ok(())
 }

@@ -99,6 +99,7 @@ impl<T> Page<T> {
 }
 
 mod attachments;
+pub use attachments::{UploadOutcomeUnknown, is_outcome_unknown};
 mod writes;
 
 impl DocmostClient {

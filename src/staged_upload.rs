@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
-    docmost_client::DocmostClient,
+    docmost_client::{DocmostClient, is_outcome_unknown},
     oauth::{random_token, token_hash},
     server::{attachment_markdown, attachment_path},
 };
@@ -352,10 +352,11 @@ async fn process_upload(upload: Pending, body: Body, forwarding: Arc<AtomicBool>
             &bytes,
         )
         .await;
-    let status = if result.is_ok() {
-        "succeeded"
-    } else {
-        "failed"
+    let uncertain = matches!(&result, Err(error) if is_outcome_unknown(error));
+    let status = match &result {
+        Ok(_) => "succeeded",
+        Err(_) if uncertain => "uncertain",
+        Err(_) => "failed",
     };
     if let Err(error) =
         crate::audit::record_mutation("upload_attachment", &upload.page_id, status).await
@@ -391,6 +392,11 @@ async fn process_upload(upload: Pending, body: Body, forwarding: Arc<AtomicBool>
                 }),
             )
         }
+        // The message already says to check the page before retrying.
+        Err(error) if uncertain => reply(
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": format!("The upload's outcome is unknown: {error}"), "uploaded": Value::Null }),
+        ),
         Err(error) => reply(
             StatusCode::BAD_GATEWAY,
             json!({ "error": format!("Docmost rejected the upload: {error}"), "uploaded": false }),

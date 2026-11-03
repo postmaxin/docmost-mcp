@@ -3,6 +3,35 @@ use serde_json::Value;
 
 use crate::{auth::manager::safe_read_response_text, debug::debug_log, types::DocmostAttachment};
 
+/// An upload error whose outcome is unknown: the request reached Docmost, or may have,
+/// so Docmost may already have stored the file. Examples are a connection reset after
+/// the request was sent and a success reply that can't be read. A connect failure or an
+/// error status from Docmost is a plain error instead, since nothing was stored.
+#[derive(Debug)]
+pub struct UploadOutcomeUnknown(pub anyhow::Error);
+
+impl std::fmt::Display for UploadOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}. Docmost may already have stored the file: check the page's attachments \
+             before uploading again",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UploadOutcomeUnknown {}
+
+fn outcome_unknown(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(UploadOutcomeUnknown(error))
+}
+
+/// True when `error` is an [`UploadOutcomeUnknown`].
+pub fn is_outcome_unknown(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UploadOutcomeUnknown>().is_some()
+}
+
 impl super::DocmostClient {
     /// Upload a file to a page through Docmost's own attachment endpoint
     /// (`POST /api/files/upload`), the same call the editor makes, so the result is an
@@ -48,7 +77,15 @@ impl super::DocmostClient {
                             .mime_str(mime_type)?,
                     ))
             })
-            .await?;
+            .await
+            .map_err(|error| match error.downcast_ref::<reqwest::Error>() {
+                // A connect or request-building failure means nothing was sent. Any other
+                // transport error (a reset or timeout) may come after Docmost read the file.
+                Some(transport) if !transport.is_connect() && !transport.is_builder() => {
+                    outcome_unknown(error)
+                }
+                _ => error,
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -62,16 +99,20 @@ impl super::DocmostClient {
 
         // Unlike most endpoints, the upload handler writes its reply directly instead of
         // returning it, so Docmost's `{ data }` envelope is skipped. Accept both shapes.
+        // From here on Docmost has said it succeeded, so an unreadable reply is uncertain.
         let mut body: Value = response
             .json()
             .await
-            .context("Failed to parse Docmost upload response body")?;
+            .context("Failed to parse Docmost upload response body")
+            .map_err(outcome_unknown)?;
         if body.get("id").is_none()
             && let Some(data) = body.get_mut("data")
         {
             body = data.take();
         }
-        serde_json::from_value(body).context("Docmost upload response was not an attachment")
+        serde_json::from_value(body)
+            .context("Docmost upload response was not an attachment")
+            .map_err(outcome_unknown)
     }
 }
 
