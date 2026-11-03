@@ -18,7 +18,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -59,10 +62,11 @@ const MAX_PENDING: usize = 256;
 /// is what bounds upload memory.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 4;
 
-/// How long a client may take to send a body. A stalled `PUT` otherwise holds its buffer
-/// and its in-flight slot until the connection dies. Ten minutes covers 50 MiB at about
-/// 0.7 Mbit/s.
-pub const DEFAULT_READ_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// How long one upload may hold its in-flight slot, from the first byte of the body to
+/// Docmost's reply. It is a single deadline rather than one per stage, so no stage (the
+/// client sending, Docmost receiving, or Docmost answering) can hold a slot unbounded.
+/// Fifteen minutes covers 50 MiB at about 0.5 Mbit/s with time left for Docmost.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// One upload that has been approved but not yet received.
 struct Pending {
@@ -91,7 +95,7 @@ pub struct UploadStager {
     public_url: String,
     max_bytes: usize,
     ttl: Duration,
-    read_deadline: Duration,
+    deadline: Duration,
 }
 
 impl std::fmt::Debug for UploadStager {
@@ -100,7 +104,7 @@ impl std::fmt::Debug for UploadStager {
             .field("public_url", &self.public_url)
             .field("max_bytes", &self.max_bytes)
             .field("ttl", &self.ttl)
-            .field("read_deadline", &self.read_deadline)
+            .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
 }
@@ -119,7 +123,7 @@ impl UploadStager {
             public_url: public_url.trim_end_matches('/').to_string(),
             max_bytes,
             ttl,
-            read_deadline: DEFAULT_READ_DEADLINE,
+            deadline: DEFAULT_DEADLINE,
         }
     }
 
@@ -129,9 +133,9 @@ impl UploadStager {
         self
     }
 
-    /// Override how long a client may take to send a body.
-    pub fn with_read_deadline(mut self, read_deadline: Duration) -> Self {
-        self.read_deadline = read_deadline;
+    /// Override how long one upload may hold its in-flight slot.
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
         self
     }
 
@@ -230,7 +234,8 @@ async fn receive_upload(
     body: Body,
 ) -> Response {
     // Claim an in-flight slot before the URL: a busy server refuses without using the URL
-    // up, so the client can simply retry. The slot is held until forwarding finishes.
+    // up, so the client can simply retry. The slot is held until the upload finishes or
+    // its deadline passes.
     let Ok(_slot) = stager.in_flight.clone().try_acquire_owned() else {
         return reply(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -250,29 +255,59 @@ async fn receive_upload(
         );
     };
 
-    // Read at most one byte past the declared size: enough to tell "too long" from "exact".
-    let read = tokio::time::timeout(
-        stager.read_deadline,
-        to_bytes(body, upload.size.saturating_add(1)),
+    let page_id = upload.page_id.clone();
+    let forwarding = Arc::new(AtomicBool::new(false));
+    let processed = tokio::time::timeout(
+        stager.deadline,
+        process_upload(upload, body, forwarding.clone()),
     )
     .await;
-    let bytes = match read {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => {
+    match processed {
+        Ok(response) => response,
+        // Dropping the future cancels the request to Docmost, but it may already have
+        // stored the file, so say so and audit it as neither success nor failure.
+        Err(_) if forwarding.load(Ordering::SeqCst) => {
+            if let Err(error) =
+                crate::audit::record_mutation("upload_attachment", &page_id, "timed_out").await
+            {
+                tracing::error!(target = %page_id, %error, "Failed to append upload timeout to audit log");
+            }
+            reply(
+                StatusCode::GATEWAY_TIMEOUT,
+                json!({
+                    "error": format!(
+                        "Docmost didn't finish the upload within {} seconds. It may already have \
+                         stored the file: check the page's attachments before uploading again.",
+                        stager.deadline.as_secs()
+                    ),
+                    "uploaded": Value::Null,
+                }),
+            )
+        }
+        Err(_) => rejected(
+            StatusCode::REQUEST_TIMEOUT,
+            format!(
+                "The body did not arrive within {} seconds. Nothing was uploaded.",
+                stager.deadline.as_secs()
+            ),
+        ),
+    }
+}
+
+/// Read, check and forward one upload. Runs under the caller's deadline; `forwarding` is
+/// set just before Docmost is contacted, so a timeout can tell "nothing was sent" from
+/// "Docmost may have it".
+async fn process_upload(upload: Pending, body: Body, forwarding: Arc<AtomicBool>) -> Response {
+    // Read at most one byte past the declared size: enough to tell "too long" from "exact".
+    let bytes = match to_bytes(body, upload.size.saturating_add(1)).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
             return rejected(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
-                    "The body is larger than the declared {} bytes, or could not be read.                      Nothing was uploaded.",
+                    "The body is larger than the declared {} bytes, or could not be read. \
+                     Nothing was uploaded.",
                     upload.size
-                ),
-            );
-        }
-        Err(_) => {
-            return rejected(
-                StatusCode::REQUEST_TIMEOUT,
-                format!(
-                    "The body did not arrive within {} seconds. Nothing was uploaded.",
-                    stager.read_deadline.as_secs()
                 ),
             );
         }
@@ -307,6 +342,7 @@ async fn receive_upload(
             json!({ "error": format!("Could not write the audit log, so nothing was uploaded: {error}"), "uploaded": false }),
         );
     }
+    forwarding.store(true, Ordering::SeqCst);
     let result = upload
         .client
         .upload_attachment(

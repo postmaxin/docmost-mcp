@@ -97,8 +97,11 @@ bits, stored only as a hash, bound to one page, file name, MIME type, size and S
 usable once, and valid for 10 minutes. Any request uses it up, including one whose body
 is refused, so a failed attempt needs a new `docmost_begin_upload`. Two cases don't use
 it up: when too many uploads are already in progress (four at once), the server answers
-`503` and the URL can be retried. A body that hasn't fully arrived within 10 minutes is
-refused with `408`. `DOCMOST_MCP_PUBLIC_URL` must be an `https://` origin outside
+`503` and the URL can be retried. Each upload has 15 minutes from its first byte to
+Docmost's reply. If the body hasn't arrived by then, it is refused with `408` and
+nothing was uploaded. If Docmost was already receiving it, the answer is `504` with
+`"uploaded": null` and the audit log records `timed_out`: Docmost may have stored the
+file, so check the page before uploading again. `DOCMOST_MCP_PUBLIC_URL` must be an `https://` origin outside
 localhost; otherwise staged uploads are turned off with a warning. The body streams to
 this server rather than through the JSON-RPC transport, so the limit is
 `DOCMOST_MCP_MAX_UPLOAD_BYTES` (50 MiB by default) rather than 2 MiB. Docmost's own

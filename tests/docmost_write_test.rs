@@ -44,6 +44,8 @@ struct CapturedState {
     upload_auth: Arc<Mutex<Vec<String>>>,
     /// When true, the upload route wraps its reply in a `{ data }` envelope.
     envelope_upload: Arc<AtomicBool>,
+    /// When true, the upload route hangs instead of answering, like a stuck Docmost.
+    stall_upload: Arc<AtomicBool>,
     /// How many times the mock `/api/auth/login` endpoint was called.
     login_hits: Arc<AtomicUsize>,
 }
@@ -211,6 +213,9 @@ async fn upload_route(
 ) -> (StatusCode, Json<Value>) {
     if let Some(status) = injected_status(&state, &state.upload_attempts) {
         return (status, Json(json!({ "message": "injected failure" })));
+    }
+    if state.stall_upload.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
     let content_type = headers
         .get("content-type")
@@ -906,8 +911,8 @@ async fn staged_upload_gives_up_on_a_body_that_stalls() -> Result<()> {
     use_test_audit_log();
     let temp = TempDir::new()?;
     let (client, state, _) = spawn(&temp).await?;
-    let stager = UploadStager::new(MCP_PUBLIC_URL, 1024)
-        .with_read_deadline(std::time::Duration::from_millis(50));
+    let stager =
+        UploadStager::new(MCP_PUBLIC_URL, 1024).with_deadline(std::time::Duration::from_millis(50));
     let url = stager
         .begin(
             client,
@@ -941,7 +946,7 @@ async fn staged_upload_refuses_when_busy_without_using_the_url_up() -> Result<()
     let (client, state, _) = spawn(&temp).await?;
     let stager = UploadStager::new(MCP_PUBLIC_URL, 1024)
         .with_max_in_flight(1)
-        .with_read_deadline(std::time::Duration::from_millis(300));
+        .with_deadline(std::time::Duration::from_millis(300));
     let begin = || {
         stager.begin(
             client.clone(),
@@ -1015,5 +1020,56 @@ async fn pinned_client_keeps_the_session_it_was_approved_with() -> Result<()> {
     );
     // The unpinned client does follow the saved session, which is what pinning guards against.
     assert_eq!(auth[1], "Bearer switched-token");
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_upload_frees_its_slot_when_docmost_hangs() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::new(MCP_PUBLIC_URL, 1024)
+        .with_max_in_flight(1)
+        .with_deadline(std::time::Duration::from_millis(300));
+    let begin = || {
+        stager.begin(
+            client.clone(),
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+    };
+    let stuck_url = begin().await?.url;
+    let next_url = begin().await?.url;
+    let app = staged_upload_routes(stager.clone());
+
+    // The body arrives intact, but Docmost never answers.
+    state.stall_upload.store(true, Ordering::SeqCst);
+    let (status, body) = put_to(&app, &stuck_url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(
+        body["uploaded"],
+        Value::Null,
+        "the outcome is unknown, not a failure"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("may already have stored"),
+        "{body}"
+    );
+    let audit = std::fs::read_to_string(std::env::var("DOCMOST_MCP_AUDIT_LOG")?)?;
+    assert!(
+        audit.contains("\"timed_out\""),
+        "the timeout must be audited"
+    );
+
+    // The deadline freed the only slot, so the next upload goes through.
+    state.stall_upload.store(false, Ordering::SeqCst);
+    let (status, body) = put_to(&app, &next_url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
     Ok(())
 }
