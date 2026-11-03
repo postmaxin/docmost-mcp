@@ -41,7 +41,7 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::{
     docmost_client::DocmostClient,
     oauth::{random_token, token_hash},
-    server::attachment_path,
+    server::{attachment_markdown, attachment_path},
 };
 
 /// How long an upload URL stays valid after `docmost_begin_upload` returns it.
@@ -375,11 +375,7 @@ async fn process_upload(upload: Pending, body: Body, forwarding: Arc<AtomicBool>
                 .as_deref()
                 .unwrap_or(&upload.mime_type)
                 .starts_with("image/");
-            let markdown = if is_image {
-                format!("![{name}]({path})")
-            } else {
-                format!("[{name}]({path})")
-            };
+            let markdown = attachment_markdown(&name, &path, is_image);
             reply(
                 StatusCode::OK,
                 json!({

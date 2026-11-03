@@ -15,7 +15,7 @@ mod tools_attachment;
 mod tools_page_write;
 mod tools_write;
 
-pub(crate) use tools_attachment::attachment_path;
+pub(crate) use tools_attachment::{attachment_markdown, attachment_path};
 
 #[derive(Debug, Clone)]
 pub struct DocmostMcpServer {

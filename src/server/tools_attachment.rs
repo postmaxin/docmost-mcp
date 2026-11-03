@@ -314,6 +314,24 @@ pub(crate) fn attachment_path(id: &str, file_name: &str) -> String {
     format!("/api/files/{id}/{}", urlencoding::encode(file_name))
 }
 
+/// The Markdown that embeds (images) or links (anything else) an attachment. The file
+/// name is escaped for use as link text: `validate_file_name` allows brackets, and an
+/// unmatched one, as in `draft[1.png`, would otherwise break the snippet.
+pub(crate) fn attachment_markdown(file_name: &str, path: &str, is_image: bool) -> String {
+    let mut label = String::with_capacity(file_name.len());
+    for c in file_name.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            label.push('\\');
+        }
+        label.push(c);
+    }
+    if is_image {
+        format!("![{label}]({path})")
+    } else {
+        format!("[{label}]({path})")
+    }
+}
+
 fn format_attachment(attachment: &DocmostAttachment, sent_name: &str, sent_size: usize) -> String {
     let name = attachment.file_name.as_deref().unwrap_or(sent_name);
     let size = attachment.file_size.unwrap_or(sent_size as u64);
@@ -345,10 +363,11 @@ fn format_attachment(attachment: &DocmostAttachment, sent_name: &str, sent_size:
         lines.push(format!("URL: {url}"));
     }
     lines.push(String::new());
+    let snippet = attachment_markdown(name, &path, is_image);
     lines.push(if is_image {
-        format!("Embed in page Markdown: `![{name}]({path})`")
+        format!("Embed in page Markdown: `{snippet}`")
     } else {
-        format!("Link from page Markdown: `[{name}]({path})`")
+        format!("Link from page Markdown: `{snippet}`")
     });
     lines.join("\n")
 }
@@ -443,6 +462,22 @@ mod tests {
         assert_eq!(
             attachment_path("0199-id", "Q3 report (final).pdf"),
             "/api/files/0199-id/Q3%20report%20%28final%29.pdf"
+        );
+    }
+
+    #[test]
+    fn markdown_snippet_escapes_brackets_in_the_name() {
+        assert_eq!(
+            attachment_markdown("diagram.png", "/api/files/i/diagram.png", true),
+            "![diagram.png](/api/files/i/diagram.png)"
+        );
+        assert_eq!(
+            attachment_markdown("draft[1.png", "/p", true),
+            "![draft\\[1.png](/p)"
+        );
+        assert_eq!(
+            attachment_markdown("a]b\\c.pdf", "/p", false),
+            "[a\\]b\\\\c.pdf](/p)"
         );
     }
 
