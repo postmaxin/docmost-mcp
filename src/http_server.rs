@@ -20,6 +20,7 @@ use tower::ServiceExt;
 use crate::{
     oauth::{DEFAULT_BRAND, OAuthConfig, OAuthState},
     server::DocmostMcpServer,
+    staged_upload::{self, DEFAULT_MAX_STAGED_BYTES, UploadStager},
     types::{AuthenticatedSession, StartupConfig},
 };
 
@@ -54,6 +55,7 @@ struct AppState {
     user_services: Arc<RwLock<HashMap<String, McpService>>>,
     mcp_config: StreamableHttpServerConfig,
     oauth: Option<OAuthState>,
+    stager: Option<UploadStager>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,11 @@ pub struct HttpServerConfig {
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub oauth: Option<OAuthConfig>,
+    /// This server's externally reachable base URL (`DOCMOST_MCP_PUBLIC_URL`). Staged
+    /// uploads are offered only when it is set, since their URLs are built under it.
+    pub public_url: Option<String>,
+    /// Largest staged upload accepted, in bytes (`DOCMOST_MCP_MAX_UPLOAD_BYTES`).
+    pub max_staged_upload_bytes: usize,
 }
 
 impl HttpServerConfig {
@@ -118,6 +125,16 @@ impl HttpServerConfig {
         } else {
             None
         };
+        let public_url = env::var("DOCMOST_MCP_PUBLIC_URL")
+            .ok()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
+        let max_staged_upload_bytes = match env::var("DOCMOST_MCP_MAX_UPLOAD_BYTES") {
+            Ok(value) => value.trim().parse::<usize>().ok().filter(|n| *n > 0).with_context(|| {
+                format!("DOCMOST_MCP_MAX_UPLOAD_BYTES must be a positive number of bytes, got {value:?}")
+            })?,
+            Err(_) => DEFAULT_MAX_STAGED_BYTES,
+        };
         if bearer_token.is_none() && oauth.is_none() {
             bail!(
                 "Set DOCMOST_MCP_BEARER_TOKEN or enable per-account auth with DOCMOST_MCP_ACCOUNT_AUTH=true"
@@ -130,6 +147,8 @@ impl HttpServerConfig {
             allowed_hosts,
             allowed_origins,
             oauth,
+            public_url,
+            max_staged_upload_bytes,
         })
     }
 }
@@ -163,8 +182,17 @@ fn build_router(startup_config: StartupConfig, config: HttpServerConfig) -> Resu
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(config.allowed_hosts)
         .with_allowed_origins(config.allowed_origins);
+    let stager = config
+        .public_url
+        .as_deref()
+        .map(|url| UploadStager::new(url, config.max_staged_upload_bytes));
+    let admin_stager = stager.clone();
     let admin_service = StreamableHttpService::new(
-        move || DocmostMcpServer::new(startup_config.clone()).map_err(std::io::Error::other),
+        move || {
+            DocmostMcpServer::new(startup_config.clone())
+                .map(|server| server.with_stager(admin_stager.clone()))
+                .map_err(std::io::Error::other)
+        },
         LocalSessionManager::default().into(),
         mcp_config.clone(),
     );
@@ -177,6 +205,7 @@ fn build_router(startup_config: StartupConfig, config: HttpServerConfig) -> Resu
         user_services: Arc::new(RwLock::new(HashMap::new())),
         mcp_config,
         oauth: oauth.clone(),
+        stager: stager.clone(),
     };
 
     let mut router = Router::new()
@@ -186,6 +215,9 @@ fn build_router(startup_config: StartupConfig, config: HttpServerConfig) -> Resu
         .with_state(state);
     if let Some(oauth) = oauth {
         router = router.merge(oauth.routes());
+    }
+    if let Some(stager) = stager {
+        router = router.merge(staged_upload::routes(stager));
     }
     Ok(router)
 }
@@ -221,7 +253,9 @@ async fn handle_mcp(State(state): State<AppState>, request: Request<Body>) -> Re
             services.retain(|fingerprint, _| active_sessions.contains(fingerprint));
             services
                 .entry(key)
-                .or_insert_with(|| user_mcp_service(session, state.mcp_config.clone()))
+                .or_insert_with(|| {
+                    user_mcp_service(session, state.mcp_config.clone(), state.stager.clone())
+                })
                 .clone()
         };
         return call_mcp_service(service, request).await;
@@ -233,9 +267,14 @@ async fn handle_mcp(State(state): State<AppState>, request: Request<Body>) -> Re
 fn user_mcp_service(
     session: AuthenticatedSession,
     config: StreamableHttpServerConfig,
+    stager: Option<UploadStager>,
 ) -> McpService {
     StreamableHttpService::new(
-        move || DocmostMcpServer::new_with_session(session.clone()).map_err(std::io::Error::other),
+        move || {
+            DocmostMcpServer::new_with_session(session.clone())
+                .map(|server| server.with_stager(stager.clone()))
+                .map_err(std::io::Error::other)
+        },
         LocalSessionManager::default().into(),
         config,
     )
@@ -312,6 +351,8 @@ mod tests {
                 allowed_hosts: vec![address.to_string()],
                 allowed_origins: vec![format!("http://{address}")],
                 oauth: None,
+                public_url: None,
+                max_staged_upload_bytes: DEFAULT_MAX_STAGED_BYTES,
             },
         )?;
         let task = tokio::spawn(async move { axum::serve(listener, app).await });

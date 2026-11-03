@@ -7,6 +7,7 @@ pub mod oauth;
 pub mod position;
 pub mod prosemirror;
 pub mod server;
+pub mod staged_upload;
 pub mod startup_config;
 pub mod storage;
 pub mod types;

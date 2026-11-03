@@ -130,14 +130,19 @@ loaded alongside this one.
 **Write** — `docmost_create_page`, `docmost_update_page`, `docmost_duplicate_page`,
 `docmost_copy_page_to_space`, `docmost_move_page`, `docmost_move_page_to_space`,
 `docmost_create_space`, `docmost_update_space`, `docmost_create_comment`,
-`docmost_update_comment`, `docmost_upload_attachment`
+`docmost_update_comment`, `docmost_upload_attachment`, `docmost_begin_upload`
 
 Write tools are gated twice — see [docs/write-tools.md](docs/write-tools.md) for the
 confirmation contract.
 
-`docmost_upload_attachment` takes the file as base64 in the call (up to 2 MiB), since
-a remote server cannot read the client's disk. It returns the attachment's
-`/api/files/{id}/{name}` path, which page Markdown can embed (`![alt](path)`) or link.
+A remote server cannot read the client's disk, so there are two ways to upload a file.
+`docmost_begin_upload` takes the file's size and SHA-256 and returns a single-use URL;
+the client then sends the raw file with an ordinary HTTP `PUT` (`curl -T file <url>`).
+Agents should prefer it: with `docmost_upload_attachment` the file travels as base64 in
+the call (up to 2 MiB), so an agent has to reproduce every byte as output, and a
+mistyped character silently corrupts the file unless `size` and `sha256` are passed.
+Both return the attachment's `/api/files/{id}/{name}` path, which page Markdown can
+embed (`![alt](path)`) or link.
 
 ### Pagination
 
@@ -158,6 +163,10 @@ when it hasn't, and never pages forever off a bad inference.
   and short-lived opaque tokens. Docmost passwords are never persisted.
 - Host and Origin allowlists are enforced (DNS-rebinding protection).
 - `/health` is public and returns only service status.
+- `/uploads/{token}` accepts one `PUT` per staged upload, with no bearer token: the
+  URL is the credential. Its 256-bit token is bound to one page, file, size and
+  SHA-256, works once, expires after 10 minutes, and carries only the session that
+  created it.
 - **Mutating tools are disabled** unless `DOCMOST_MCP_ENABLE_WRITES=true`, *and*
   every mutation additionally requires `confirm: true` in that individual call.
 - Mutation *metadata* is appended to a mode-`0600` JSONL audit log. Page and comment
@@ -176,7 +185,8 @@ See [SECURITY.md](SECURITY.md) for deployment boundaries and how to report issue
 | `DOCMOST_EMAIL`, `DOCMOST_PASSWORD` | — | Community-edition fallback; both must be set |
 | `DOCMOST_MCP_BEARER_TOKEN` | required unless account auth is enabled | Static local/break-glass token for `/mcp` |
 | `DOCMOST_MCP_ACCOUNT_AUTH` | `false` | Enables per-account browser login and OAuth discovery |
-| `DOCMOST_MCP_PUBLIC_URL` | — | Public HTTPS origin; required when account auth is enabled |
+| `DOCMOST_MCP_PUBLIC_URL` | — | Public HTTPS origin; required when account auth is enabled, and enables `docmost_begin_upload` |
+| `DOCMOST_MCP_MAX_UPLOAD_BYTES` | `52428800` (50 MiB) | Largest file `docmost_begin_upload` accepts |
 | `DOCMOST_MCP_BRAND` | `Docmost` | Product name on the sign-in pages, for rebranded deployments |
 | `DOCMOST_MCP_BIND` | `127.0.0.1:8787` | HTTP listen address |
 | `DOCMOST_MCP_ALLOWED_HOSTS` | loopback | Comma-separated Host allowlist |

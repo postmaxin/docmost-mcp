@@ -54,6 +54,7 @@ async fn server_lists_expected_tools() -> Result<()> {
         "docmost_create_comment",
         "docmost_update_comment",
         "docmost_upload_attachment",
+        "docmost_begin_upload",
     ] {
         assert!(
             tool_names.iter().any(|name| name == expected),
@@ -64,7 +65,7 @@ async fn server_lists_expected_tools() -> Result<()> {
     // Exactly the expected surface: no accidental extra/duplicate registration.
     assert_eq!(
         tool_names.len(),
-        21,
+        22,
         "unexpected tool count: {tool_names:?}"
     );
     let mut unique = tool_names.clone();

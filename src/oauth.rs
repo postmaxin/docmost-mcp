@@ -1153,13 +1153,13 @@ fn is_loopback_host(host: Option<&str>) -> bool {
     matches!(host, Some("localhost" | "127.0.0.1" | "::1"))
 }
 
-fn random_token(bytes: usize) -> String {
+pub(crate) fn random_token(bytes: usize) -> String {
     let mut value = vec![0_u8; bytes];
     OsRng.fill_bytes(&mut value);
     URL_SAFE_NO_PAD.encode(value)
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 

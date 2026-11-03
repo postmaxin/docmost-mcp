@@ -6,21 +6,24 @@ use std::sync::{
 use anyhow::Result;
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes, to_bytes},
     extract::State,
-    http::{HeaderMap, StatusCode, header::SET_COOKIE},
+    http::{HeaderMap, Request, StatusCode, header::SET_COOKIE},
     routing::post,
 };
 use docmost_mcp::{
     docmost_client::DocmostClient,
     prosemirror::markdown_to_prosemirror,
+    staged_upload::{UploadStager, routes as staged_upload_routes},
     startup_config::normalize_base_url,
     storage::state_store::StateStore,
     types::{AuthenticatedSession, StartupConfig, StoredConfig, StoredCredentials, StoredSession},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tower::ServiceExt;
 
 #[derive(Clone, Default)]
 struct CapturedState {
@@ -699,5 +702,185 @@ async fn upload_attachment_resolves_a_slug_to_the_page_uuid() -> Result<()> {
         .expect_err("unknown page must fail before uploading");
     assert!(error.to_string().contains("404"), "{error}");
     assert_eq!(state.upload_bodies.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+// ---- staged uploads (docmost_begin_upload + PUT /uploads/{token}) -----------
+
+const MCP_PUBLIC_URL: &str = "http://mcp.example";
+
+/// The upload route audits every write. Point the log at one temp file for the whole
+/// test binary, since tests run in parallel and the variable is process-wide.
+fn use_test_audit_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let path = std::env::temp_dir().join(format!(
+            "docmost-mcp-staged-upload-audit-{}.jsonl",
+            std::process::id()
+        ));
+        unsafe {
+            std::env::set_var("DOCMOST_MCP_AUDIT_LOG", path);
+        }
+    });
+}
+
+fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+async fn put_to(app: &Router, url: &str, body: Vec<u8>) -> Result<(StatusCode, Value)> {
+    let path = url
+        .strip_prefix(MCP_PUBLIC_URL)
+        .expect("URL under the public base");
+    let response = app
+        .clone()
+        .oneshot(Request::put(path).body(Body::from(body))?)
+        .await?;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
+}
+
+#[tokio::test]
+async fn staged_upload_sends_the_raw_bytes_once() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::new(&format!("{MCP_PUBLIC_URL}/"), 1024);
+
+    let begun = stager
+        .begin(
+            client,
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+        .await?;
+    assert!(
+        begun.url.starts_with(&format!("{MCP_PUBLIC_URL}/uploads/")),
+        "{}",
+        begun.url
+    );
+    assert_eq!(stager.pending_count().await, 1);
+
+    let app = staged_upload_routes(stager.clone());
+    let (status, body) = put_to(&app, &begun.url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["uploaded"], json!(true));
+    assert_eq!(
+        body["path"],
+        json!("/api/files/0199aaaa-0000-7000-8000-000000000001/diagram.png")
+    );
+    assert_eq!(
+        body["markdown"],
+        json!("![diagram.png](/api/files/0199aaaa-0000-7000-8000-000000000001/diagram.png)")
+    );
+
+    // The exact bytes reached Docmost's upload endpoint, after the pageId field.
+    let raw = state.upload_bodies.lock().unwrap().last().cloned().unwrap();
+    let file_part = find_bytes(&raw, b"name=\"file\"; filename=\"diagram.png\"").unwrap();
+    assert!(find_bytes(&raw, PAGE_UUID.as_bytes()).is_some_and(|at| at < file_part));
+    assert!(find_bytes(&raw, PNG_ISH).is_some_and(|at| at > file_part));
+
+    // Single use: the same URL is now gone, and nothing else reached Docmost.
+    let (status, _) = put_to(&app, &begun.url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(state.upload_bodies.lock().unwrap().len(), 1);
+    assert_eq!(stager.pending_count().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_upload_refuses_mismatched_bodies_before_reaching_docmost() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::new(MCP_PUBLIC_URL, 1024);
+    let app = staged_upload_routes(stager.clone());
+    let begin = || {
+        stager.begin(
+            client.clone(),
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+    };
+
+    // Same length, one byte changed: only the hash can catch it.
+    let mut altered = PNG_ISH.to_vec();
+    altered[1] ^= 0x01;
+    let url = begin().await?.url;
+    let (status, body) = put_to(&app, &url, altered).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("SHA-256"),
+        "{body}"
+    );
+    // A rejected attempt uses the URL up, even for the right file afterwards.
+    let (status, _) = put_to(&app, &url, PNG_ISH.to_vec()).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let url = begin().await?.url;
+    let (status, body) = put_to(&app, &url, PNG_ISH[..4].to_vec()).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("declared"),
+        "{body}"
+    );
+
+    let url = begin().await?.url;
+    let mut longer = PNG_ISH.to_vec();
+    longer.extend_from_slice(b"extra");
+    let (status, _) = put_to(&app, &url, longer).await?;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (status, _) = put_to(
+        &app,
+        &format!("{MCP_PUBLIC_URL}/uploads/not-a-real-token"),
+        PNG_ISH.to_vec(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    assert!(
+        state.upload_bodies.lock().unwrap().is_empty(),
+        "no rejected body may reach Docmost"
+    );
+    assert_eq!(stager.pending_count().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_upload_url_expires() -> Result<()> {
+    use_test_audit_log();
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    let stager = UploadStager::with_ttl(MCP_PUBLIC_URL, 1024, std::time::Duration::from_millis(20));
+    let url = stager
+        .begin(
+            client,
+            PAGE_UUID,
+            "diagram.png",
+            "image/png",
+            PNG_ISH.len(),
+            sha256_of(PNG_ISH),
+        )
+        .await?
+        .url;
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    let (status, _) = put_to(
+        &staged_upload_routes(stager.clone()),
+        &url,
+        PNG_ISH.to_vec(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(stager.pending_count().await, 0);
+    assert!(state.upload_bodies.lock().unwrap().is_empty());
     Ok(())
 }

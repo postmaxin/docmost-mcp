@@ -1,8 +1,10 @@
-//! Attachment write tool: `docmost_upload_attachment`.
+//! Attachment write tools: `docmost_upload_attachment` and `docmost_begin_upload`.
 //!
-//! The file travels inside the tool arguments as base64 rather than as a local path:
-//! over the HTTP transport this server usually runs on a different machine from the
-//! client, so it cannot read the caller's filesystem.
+//! Over the HTTP transport this server usually runs on a different machine from the
+//! client, so it cannot read the caller's filesystem. `docmost_upload_attachment` takes
+//! the file as base64 in the arguments, which forces an agent to generate every byte as
+//! output. `docmost_begin_upload` avoids that: it returns a single-use URL that the client
+//! `PUT`s the raw file to (see [`crate::staged_upload`]).
 //!
 //! In its own `#[tool_router]` impl (a named `attachment_tool_router`, merged into the
 //! server's router in `new()`) to keep each tools file within the size limit.
@@ -10,9 +12,12 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::{handler::server::wrapper::Parameters, model::ErrorData, tool, tool_router};
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     server::{DocmostMcpServer, render::format_optional_id},
-    types::{DocmostAttachment, UploadAttachmentInput},
+    staged_upload::{parse_sha256, to_hex},
+    types::{BeginUploadInput, DocmostAttachment, UploadAttachmentInput},
 };
 
 /// Largest file accepted, in decoded bytes (2 MiB).
@@ -33,12 +38,16 @@ impl DocmostMcpServer {
     #[tool(
         name = "docmost_upload_attachment",
         description = "Upload a file (base64, at most 2 MiB) to a Docmost page as a normal \
-                       Docmost attachment. Returns the attachment ID and its path, \
-                       `/api/files/{attachment_id}/{file_name}`. Uploading does not change the \
-                       page body; to show the file, reference that path in page Markdown via \
-                       docmost_update_page: `![alt](/api/files/...)` embeds an image, \
-                       `[name](/api/files/...)` links any file. Keep the path relative so it \
-                       resolves on the Docmost origin for signed-in readers.",
+                       Docmost attachment. If you can run a command such as curl, prefer \
+                       docmost_begin_upload: it sends the file's bytes directly, so they never \
+                       have to be reproduced as base64. If you use this tool, pass `size` and \
+                       `sha256` so a corrupted copy is refused instead of stored. Returns the \
+                       attachment ID and its path, `/api/files/{attachment_id}/{file_name}`. \
+                       Uploading does not change the page body; to show the file, reference \
+                       that path in page Markdown via docmost_update_page: \
+                       `![alt](/api/files/...)` embeds an image, `[name](/api/files/...)` links \
+                       any file. Keep the path relative so it resolves on the Docmost origin \
+                       for signed-in readers.",
         annotations(
             title = "Upload Docmost Attachment",
             read_only_hint = false,
@@ -56,6 +65,7 @@ impl DocmostMcpServer {
         validate_file_name(&input.file_name)?;
         let mime_type = validate_mime_type(input.mime_type.as_deref())?;
         let bytes = decode_content(&input.content_base64)?;
+        verify_content(&bytes, input.size, input.sha256.as_deref())?;
 
         let attachment = self
             .run_write(
@@ -72,6 +82,134 @@ impl DocmostMcpServer {
             bytes.len(),
         ))
     }
+
+    #[tool(
+        name = "docmost_begin_upload",
+        description = "Start uploading a file to a Docmost page without sending its bytes \
+                       through the conversation. Give the file's exact size and SHA-256 (for \
+                       example from `sha256sum`). Returns a single-use URL; send the raw file \
+                       to it with one HTTP PUT, such as `curl -fsS -T <file> '<url>'`. The \
+                       server uploads it only if the size and hash match, and the PUT \
+                       response gives the attachment ID, its `/api/files/...` path and a \
+                       Markdown snippet to use with docmost_update_page. The URL expires \
+                       after 10 minutes. Use this instead of docmost_upload_attachment \
+                       whenever you can run a command such as curl.",
+        annotations(
+            title = "Begin Docmost Upload",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn begin_upload(
+        &self,
+        Parameters(input): Parameters<BeginUploadInput>,
+    ) -> Result<String, ErrorData> {
+        validate_file_name(&input.file_name)?;
+        let mime_type = validate_mime_type(input.mime_type.as_deref())?.to_string();
+        let Some(stager) = self.stager.clone() else {
+            return Err(ErrorData::invalid_params(
+                "Staged uploads aren't available on this server: they need the HTTP transport \
+                 with DOCMOST_MCP_PUBLIC_URL set. Use docmost_upload_attachment instead."
+                    .to_string(),
+                None,
+            ));
+        };
+        let size = usize::try_from(input.size).unwrap_or(usize::MAX);
+        if size == 0 {
+            return Err(ErrorData::invalid_params(
+                "Invalid size: the file must not be empty.".to_string(),
+                None,
+            ));
+        }
+        if size > stager.max_bytes() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "File is too large: the limit for staged uploads is {} bytes.",
+                    stager.max_bytes()
+                ),
+                None,
+            ));
+        }
+        let sha256 = parse_sha256(&input.sha256).ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Invalid sha256: expected 64 hex characters.".to_string(),
+                None,
+            )
+        })?;
+
+        let begun = self
+            .run_write(
+                input.confirm,
+                "begin_upload",
+                &input.page_id,
+                stager.begin(
+                    self.client.clone(),
+                    &input.page_id,
+                    &input.file_name,
+                    &mime_type,
+                    size,
+                    sha256,
+                ),
+            )
+            .await?;
+        Ok(format!(
+            "Ready for \"{name}\" ({size} bytes, {mime_type}). Send the file with one HTTP PUT \
+             within {minutes} minutes; the URL works once:\n\n\
+             curl -fsS -T <file> '{url}'\n\n\
+             Nothing is uploaded unless the body is exactly {size} bytes with SHA-256 {hash}. \
+             The PUT response is JSON with the attachment ID, its `path` and a ready-made \
+             `markdown` snippet for docmost_update_page. If it reports a mismatch, the URL is \
+             used up: call docmost_begin_upload again.",
+            name = input.file_name,
+            minutes = begun.expires_in.as_secs().div_ceil(60),
+            url = begun.url,
+            hash = to_hex(&sha256),
+        ))
+    }
+}
+
+/// Check decoded base64 against the caller's optional size and SHA-256, so a copy that was
+/// corrupted but still decodes is refused rather than stored.
+pub(crate) fn verify_content(
+    bytes: &[u8],
+    size: Option<u64>,
+    sha256: Option<&str>,
+) -> Result<(), ErrorData> {
+    if let Some(size) = size
+        && bytes.len() as u64 != size
+    {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "content_base64 decoded to {} bytes but size is {size}. Nothing was uploaded; \
+                 the base64 was probably altered when copied.",
+                bytes.len()
+            ),
+            None,
+        ));
+    }
+    if let Some(expected) = sha256 {
+        let expected = parse_sha256(expected).ok_or_else(|| {
+            ErrorData::invalid_params(
+                "Invalid sha256: expected 64 hex characters.".to_string(),
+                None,
+            )
+        })?;
+        let actual: [u8; 32] = Sha256::digest(bytes).into();
+        if actual != expected {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "content_base64 has SHA-256 {} but sha256 is {}. Nothing was uploaded; the \
+                     base64 was probably altered when copied.",
+                    to_hex(&actual),
+                    to_hex(&expected)
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reject names that are empty, overlong, or could be read as a path. Docmost sanitizes
@@ -304,5 +442,31 @@ mod tests {
             attachment_path("0199-id", "Q3 report (final).pdf"),
             "/api/files/0199-id/Q3%20report%20%28final%29.pdf"
         );
+    }
+
+    // SHA-256 of b"hello".
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn verify_content_accepts_matching_or_absent_checks() {
+        assert!(verify_content(b"hello", None, None).is_ok());
+        assert!(verify_content(b"hello", Some(5), None).is_ok());
+        assert!(verify_content(b"hello", Some(5), Some(HELLO_SHA256)).is_ok());
+        assert!(verify_content(b"hello", None, Some(&HELLO_SHA256.to_uppercase())).is_ok());
+    }
+
+    #[test]
+    fn verify_content_refuses_a_corrupted_copy() {
+        let err = verify_content(b"hello", Some(6), None).unwrap_err();
+        assert!(
+            err.message.contains("decoded to 5 bytes"),
+            "{}",
+            err.message
+        );
+        // Same length, one byte different: decodes fine, only the hash catches it.
+        let err = verify_content(b"hellp", Some(5), Some(HELLO_SHA256)).unwrap_err();
+        assert!(err.message.contains("SHA-256"), "{}", err.message);
+        let err = verify_content(b"hello", None, Some("not-hex")).unwrap_err();
+        assert!(err.message.contains("Invalid sha256"), "{}", err.message);
     }
 }
