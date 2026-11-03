@@ -706,6 +706,24 @@ async fn upload_attachment_surfaces_server_error() -> Result<()> {
 }
 
 #[tokio::test]
+async fn upload_attachment_marks_a_gateway_error_as_uncertain() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (client, state, _) = spawn(&temp).await?;
+    for status in [502, 504, 500] {
+        state.force_status.store(status, Ordering::SeqCst);
+        let error = client
+            .upload_attachment(PAGE_UUID, "diagram.png", "image/png", PNG_ISH)
+            .await
+            .expect_err("a 5xx must surface as an error");
+        assert!(
+            docmost_mcp::docmost_client::is_outcome_unknown(&error),
+            "{status}: a proxy can answer this after Docmost stored the file: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn upload_attachment_marks_an_unreadable_success_as_uncertain() -> Result<()> {
     let temp = TempDir::new()?;
     let (client, state, _) = spawn(&temp).await?;

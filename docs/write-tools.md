@@ -69,10 +69,12 @@ it up: when too many uploads are already in progress (four at once), the server 
 Docmost's reply. If the body hasn't arrived by then, it is refused with `408` and
 nothing was uploaded. If Docmost was already receiving it, the answer is `504` with
 `"uploaded": null` and the audit log records `timed_out`: Docmost may have stored the
-file, so check the page before uploading again. The same goes for a connection that
-breaks after the file was sent, or a success reply that can't be read: the answer is
-`502` with `"uploaded": null`, and the audit log records `uncertain`. An error status
-from Docmost is a plain `502` with `"uploaded": false`, and nothing was stored. `DOCMOST_MCP_PUBLIC_URL` must be an `https://` origin outside
+file, so check the page before uploading again. The same goes for any other error
+once the file may have been sent, such as a broken connection, a `5xx` from Docmost or
+from a proxy in front of it, or a success reply that can't be read: the answer is `502`
+with `"uploaded": null`, and the audit log records `uncertain`. Only a failure before
+sending or a `4xx` from Docmost (a refusal, such as missing edit access) proves nothing
+was stored; those answer `502` with `"uploaded": false`. `DOCMOST_MCP_PUBLIC_URL` must be an `https://` origin outside
 localhost; otherwise staged uploads are turned off with a warning. The body streams to
 this server rather than through the JSON-RPC transport, so the limit is
 `DOCMOST_MCP_MAX_UPLOAD_BYTES` (50 MiB by default) rather than 2 MiB. Docmost's own

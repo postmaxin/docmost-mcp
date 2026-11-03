@@ -3,10 +3,14 @@ use serde_json::Value;
 
 use crate::{auth::manager::safe_read_response_text, debug::debug_log, types::DocmostAttachment};
 
-/// An upload error whose outcome is unknown: the request reached Docmost, or may have,
-/// so Docmost may already have stored the file. Examples are a connection reset after
-/// the request was sent and a success reply that can't be read. A connect failure or an
-/// error status from Docmost is a plain error instead, since nothing was stored.
+/// An upload error whose outcome is unknown: Docmost may already have stored the file.
+///
+/// Once the request may have left this server, every error is unknown unless it proves
+/// nothing was stored. Only two things prove that: the request never left (a connect or
+/// request-building failure, or an error before sending) or the reply is a `4xx`, a
+/// refusal of the request itself. Anything else, such as a connection reset, a `5xx`
+/// from Docmost or from a proxy in front of it, or a success reply that can't be read,
+/// may come after the file was stored.
 #[derive(Debug)]
 pub struct UploadOutcomeUnknown(pub anyhow::Error);
 
@@ -90,11 +94,18 @@ impl super::DocmostClient {
         if !response.status().is_success() {
             let status = response.status();
             let details = safe_read_response_text(response).await;
-            return Err(anyhow!(
+            let error = anyhow!(
                 format!("Docmost file upload failed ({status}). {details}")
                     .trim()
                     .to_string()
-            ));
+            );
+            // A 4xx refuses the request, so nothing was stored. Anything else (a 5xx from
+            // Docmost or from a proxy in front of it) may come after the file was stored.
+            return Err(if status.is_client_error() {
+                error
+            } else {
+                outcome_unknown(error)
+            });
         }
 
         // Unlike most endpoints, the upload handler writes its reply directly instead of
