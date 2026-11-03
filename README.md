@@ -130,19 +130,17 @@ loaded alongside this one.
 **Write** — `docmost_create_page`, `docmost_update_page`, `docmost_duplicate_page`,
 `docmost_copy_page_to_space`, `docmost_move_page`, `docmost_move_page_to_space`,
 `docmost_create_space`, `docmost_update_space`, `docmost_create_comment`,
-`docmost_update_comment`, `docmost_upload_attachment`, `docmost_begin_upload`
+`docmost_update_comment`, `docmost_begin_upload`
 
 Write tools are gated twice — see [docs/write-tools.md](docs/write-tools.md) for the
 confirmation contract.
 
-A remote server cannot read the client's disk, so there are two ways to upload a file.
-`docmost_begin_upload` takes the file's size and SHA-256 and returns a single-use URL;
-the client then sends the raw file with an ordinary HTTP `PUT` (`curl -T file <url>`).
-Agents should prefer it: with `docmost_upload_attachment` the file travels as base64 in
-the call (up to 2 MiB), so an agent has to reproduce every byte as output, and a
-mistyped character silently corrupts the file unless `size` and `sha256` are passed.
-Both return the attachment's `/api/files/{id}/{name}` path, which page Markdown can
-embed (`![alt](path)`) or link.
+A remote server cannot read the client's disk, and a file passed in the tool call
+would have to be reproduced byte by byte as model output. So `docmost_begin_upload`
+takes the file's size and SHA-256 and returns a single-use URL; the client then sends
+the raw file with an ordinary HTTP `PUT` (`curl -T file <url>`). The response gives
+the attachment's `/api/files/{id}/{name}` path, which page Markdown can embed
+(`![alt](path)`) or link.
 
 ### Pagination
 

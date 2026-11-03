@@ -53,22 +53,14 @@ All notable changes are documented here. The format loosely follows
   `move_page` and `create_page`.
 
 ### Added
-- **`docmost_upload_attachment`** uploads a file to a page as a normal Docmost
-  attachment, through the same `POST /api/files/upload` call the editor makes. The
-  file is passed as base64 in the tool arguments, because a remote server cannot read
-  the client's filesystem. Files can be up to 2 MiB once decoded, which keeps the
-  request under the Streamable HTTP transport's 4 MiB body limit. The tool returns the attachment ID, the
-  Docmost-normalized file name, the size, and the relative `/api/files/{id}/{name}`
-  path to embed (`![alt](path)`) or link from page Markdown. It is a write tool,
-  so it is default-deny, needs `confirm: true` on each call, and writes metadata-only
-  audit entries. Slug IDs are resolved to the page UUID first: Docmost 0.96 accepts a slug for its
-  permission check but then fails to store the attachment. Optional `size` and `sha256`
-  arguments refuse base64 that was altered in copying but still decodes.
-- **`docmost_begin_upload`** uploads a file without its bytes passing through the
-  model. It returns a single-use URL; the client `PUT`s the raw file there, and the
-  server uploads it only if the declared size and SHA-256 match. Base64 in tool
-  arguments makes an agent reproduce every byte as output, which is slow and easily
-  corrupted, so agents should prefer this whenever they can run `curl`. The URL is a
+- **`docmost_begin_upload`** uploads a file to a page as a normal Docmost attachment,
+  through the same `POST /api/files/upload` call the editor makes, without the bytes
+  passing through the model. It returns a single-use URL; the client `PUT`s the raw
+  file there, and the server uploads it only if the declared size and SHA-256 match.
+  The response gives the attachment ID, the Docmost-normalized file name and the
+  relative `/api/files/{id}/{name}` path to embed or link from page Markdown. Slug IDs
+  are resolved to the page UUID first: Docmost 0.96 accepts a slug for its permission
+  check but then fails to store the attachment. The URL is a
   256-bit, hash-stored, single-use token that expires after 10 minutes and carries
   only the session that created it. Needs the HTTP transport and
   `DOCMOST_MCP_PUBLIC_URL`; the size limit is `DOCMOST_MCP_MAX_UPLOAD_BYTES` (50 MiB by

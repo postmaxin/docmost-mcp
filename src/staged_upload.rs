@@ -1,6 +1,6 @@
 //! Staged uploads: get a file's bytes to Docmost without passing them through the model.
 //!
-//! `docmost_upload_attachment` takes the file as base64 in the tool arguments, because over
+//! A tool that took the file in its arguments would need it as base64, because over
 //! the HTTP transport this server cannot read the client's filesystem. But an agent can only
 //! fill a tool argument by generating it, so base64 makes the agent reproduce every byte as
 //! output: slow, capped by the transport's request limit, and a single wrong character

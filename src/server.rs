@@ -80,10 +80,10 @@ impl DocmostMcpServer {
             .await
             .map_err(internal_error)?;
         let result = future.await;
-        let status = match &result {
-            Ok(_) => "succeeded",
-            Err(error) if crate::docmost_client::is_outcome_unknown(error) => "uncertain",
-            Err(_) => "failed",
+        let status = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
         };
         if let Err(error) = crate::audit::record_mutation(operation, target, status).await {
             tracing::error!(%operation, %target, %status, %error, "Failed to append mutation outcome to audit log");

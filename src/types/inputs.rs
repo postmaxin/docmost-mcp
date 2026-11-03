@@ -270,39 +270,6 @@ pub struct UpdateCommentInput {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct UploadAttachmentInput {
-    #[schemars(description = "Must be true after the user reviews and approves this mutation.")]
-    pub confirm: bool,
-    #[schemars(
-        description = "The Docmost page ID or slug ID to attach the file to. Requires edit access to the page."
-    )]
-    pub page_id: String,
-    #[schemars(
-        description = "File name including its extension, e.g. `diagram.png`. No path separators. Docmost derives the stored MIME type from the extension and may normalise the name (spaces become underscores); use the name returned."
-    )]
-    pub file_name: String,
-    #[schemars(
-        description = "The file's bytes, standard base64-encoded (no `data:` prefix; line breaks are ignored). At most 2 MiB once decoded."
-    )]
-    pub content_base64: String,
-    #[serde(default)]
-    #[schemars(
-        description = "Optional MIME type sent with the upload, e.g. `image/png`. Defaults to `application/octet-stream`."
-    )]
-    pub mime_type: Option<String>,
-    #[serde(default)]
-    #[schemars(
-        description = "Optional expected size of the decoded file in bytes. If given and it doesn't match, nothing is uploaded."
-    )]
-    pub size: Option<u64>,
-    #[serde(default)]
-    #[schemars(
-        description = "Optional expected SHA-256 of the decoded file, as 64 hex characters. If given and it doesn't match, nothing is uploaded. Catches base64 that was corrupted but still decodes."
-    )]
-    pub sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct BeginUploadInput {
     #[schemars(description = "Must be true after the user reviews and approves this mutation.")]
     pub confirm: bool,
