@@ -122,9 +122,15 @@ tokens expire with that session. Consent normally reuses the browser's
 current session, so a session signed in six days ago yields a connection
 that ends a day later. To avoid that, set `DOCMOST_MCP_MIN_SESSION_REMAINING`
 (e.g. `6d23h` with Docmost's `JWT_TOKEN_EXPIRES_IN=7d`). A session with less
-time left is not offered for consent; the page asks the user to sign in
-again, which gives the browser, and the connection, a full-length session.
-Keep it below Docmost's session lifetime, or no session ever qualifies.
+time left is not offered for consent. Docmost's `/login` forwards a
+signed-in browser straight to the app, so the page offers a "Sign out and
+continue" button: it expires Docmost's `authToken` cookie in this browser
+(the session itself is not revoked, so connections already granted from it
+keep working until it ends) and then shows the usual sign-in link. Signing
+in again gives the browser, and the connection, a full-length session.
+Signing out from Docmost's own menu works too. Keep the value below
+Docmost's session lifetime, or no session ever qualifies; values over
+`3650d` are rejected at startup.
 
 Without `DOCMOST_MCP_BROWSER_URL`, the existing credential relay remains
 available for deployments that cannot route OAuth on the Docmost origin.

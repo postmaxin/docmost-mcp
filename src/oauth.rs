@@ -12,7 +12,7 @@ use axum::{
     Form, Json, Router,
     extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -65,6 +65,10 @@ const MAX_BRAND_LENGTH: usize = 60;
 /// must never name a specific MCP client: Claude Code, Claude Desktop, Codex and
 /// Cursor all speak this protocol, and the user is looking at whichever they used.
 const UNNAMED_CLIENT: &str = "your MCP client";
+/// Upper bound for `DOCMOST_MCP_MIN_SESSION_REMAINING`. Docmost's default
+/// session lasts 90 days; a minimum over ten years is a typo, and one past
+/// chrono's date range could never be met.
+const MAX_MIN_SESSION_REMAINING_DAYS: i64 = 3_650;
 
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
@@ -290,6 +294,9 @@ impl OAuthState {
             Some(path) => load_or_create_key(path)?,
             None => random_key(),
         };
+        if let Some(minimum) = config.min_session_remaining {
+            validate_min_session_remaining(minimum)?;
+        }
         Ok(Self {
             inner: Arc::new(OAuthInner {
                 browser_url,
@@ -337,6 +344,7 @@ impl OAuthState {
             )
             .route("/oauth/token", post(exchange_token))
             .route("/oauth/resume", get(resume_native_authorization))
+            .route("/oauth/renew", post(renew_browser_session))
             .layer(DefaultBodyLimit::max(16 * 1_024))
             .with_state(self)
     }
@@ -1245,11 +1253,23 @@ async fn browser_session(state: &OAuthState, headers: &HeaderMap) -> BrowserSess
 /// A session whose expiry is unknown is accepted: the minimum cannot apply.
 fn classify_session(minimum: Option<Duration>, session: AuthenticatedSession) -> BrowserSession {
     match (minimum, session_expiry(&session)) {
-        (Some(minimum), Some(expiry)) if expiry < Utc::now() + minimum => {
+        // Compare the time left with the minimum instead of computing
+        // `now + minimum`, which panics when the sum leaves chrono's range.
+        (Some(minimum), Some(expiry)) if expiry.signed_duration_since(Utc::now()) < minimum => {
             BrowserSession::EndsTooSoon(expiry)
         }
         _ => BrowserSession::Usable(session),
     }
+}
+
+/// Rejects a configured minimum no Docmost session could plausibly meet.
+fn validate_min_session_remaining(minimum: Duration) -> anyhow::Result<()> {
+    if minimum < Duration::zero() || minimum > Duration::days(MAX_MIN_SESSION_REMAINING_DAYS) {
+        anyhow::bail!(
+            "DOCMOST_MCP_MIN_SESSION_REMAINING must be at most {MAX_MIN_SESSION_REMAINING_DAYS}d; keep it below Docmost's JWT_TOKEN_EXPIRES_IN"
+        );
+    }
+    Ok(())
 }
 
 fn session_expiry(session: &AuthenticatedSession) -> Option<DateTime<Utc>> {
@@ -1412,6 +1432,85 @@ async fn resume_native_authorization(
     )
 }
 
+/// Signs this browser out of a Docmost session that ends too soon, so the user
+/// can sign in again for a full-length one.
+///
+/// Docmost's `/login` sends a signed-in browser straight on to the app, so a
+/// session cannot be renewed by visiting it. This handler runs on the Docmost
+/// origin (`/oauth/*` is forwarded here), so it can expire Docmost's host-only
+/// `authToken` cookie itself; `/login` then shows its form (or the SSO
+/// button) and signing in sets a fresh cookie. The session is deliberately not
+/// revoked through `POST /api/auth/logout`: connections already granted from
+/// it keep working until it ends, as they would have anyway.
+async fn renew_browser_session(
+    State(state): State<OAuthState>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    if state.inner.browser_url.is_none() {
+        return oauth_html_error(StatusCode::NOT_FOUND, "Native login is not enabled.");
+    }
+    if !native_host_matches(&state, &headers) {
+        return oauth_html_error(
+            StatusCode::BAD_REQUEST,
+            "Use the configured Docmost authorization origin.",
+        );
+    }
+    let pending = state
+        .inner
+        .pending
+        .read()
+        .await
+        .get(&form.request_id)
+        .cloned();
+    let cookie_csrf = cookie_value(&headers, "mcp_auth_csrf");
+    let valid = pending.is_some_and(|p| {
+        p.expires_at > Utc::now()
+            && cookie_csrf.as_deref().is_some_and(|cookie| {
+                constant_time_equal(&token_hash(cookie), &p.csrf_hash)
+                    && constant_time_equal(&token_hash(&form.csrf), &p.csrf_hash)
+            })
+    });
+    if !valid {
+        return oauth_html_error(
+            StatusCode::BAD_REQUEST,
+            "This authorization request has expired or its security check failed.",
+        );
+    }
+    let resume = format!(
+        "/oauth/resume?request_id={}",
+        urlencoding::encode(&form.request_id)
+    );
+    let mut response = hardened_auth_response(Redirect::to(&resume).into_response());
+    // Only a session that is still too short is signed out: if the user has
+    // already signed in again in another tab, keep the new session.
+    if matches!(
+        browser_session(&state, &headers).await,
+        BrowserSession::EndsTooSoon(_)
+    ) {
+        let secure = if state
+            .inner
+            .browser_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))
+        {
+            "; Secure"
+        } else {
+            ""
+        };
+        // Same name, host and path as Docmost's own cookie, so this replaces
+        // it; Docmost's logout clears it the same way.
+        let cookie = format!(
+            "authToken=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax{secure}"
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&cookie).expect("generated cookie is valid"),
+        );
+    }
+    response
+}
+
 fn render_native_page(
     request_id: &str,
     csrf: &str,
@@ -1430,24 +1529,25 @@ fn render_native_page(
 <p>Your account's space permissions apply. Writes still require explicit confirmation.</p>"#,
             escape_html(&session.email)
         )
+    } else if let BrowserSession::EndsTooSoon(expiry) = session {
+        // Docmost's /login forwards a signed-in browser to the app, so the
+        // user must leave this session before signing in again. The button
+        // does that (see renew_browser_session); signing out from Docmost's
+        // own menu works too, and the refresh picks up either.
+        format!(
+            r#"<meta http-equiv="refresh" content="5;url=/oauth/resume?request_id={request_id}">
+<h1>Sign in to {brand} again</h1><p>Your current session ends {}, too soon for this connection. Sign this browser out, then sign in again to start a new session.</p>
+<form method="post" action="/oauth/renew"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Sign out and continue</button></form>
+<p>Connections you already made keep working until their own session ends. You can also sign out from {brand}'s menu and sign in again; this page continues once you have.</p>"#,
+            expiry.format("%Y-%m-%d %H:%M UTC")
+        )
     } else {
         // Open the ordinary login in a tab: Docmost's SPA controls its own
         // post-login navigation. This waiting document resumes independently,
         // without requiring a patch to Docmost or sharing cookies across hosts.
-        // A session that ends too soon is renewed the same way: signing in
-        // again gives the browser a new session with a full lifetime.
-        let intro = match session {
-            BrowserSession::EndsTooSoon(expiry) => format!(
-                "<h1>Sign in to {brand} again</h1><p>Your current session ends {}, too soon for this connection. Sign in again to start a new session. This page will continue once you have.</p>",
-                expiry.format("%Y-%m-%d %H:%M UTC")
-            ),
-            _ => format!(
-                "<h1>Sign in to {brand}</h1><p>Use the existing Docmost login screen. This page will continue once you have signed in.</p>"
-            ),
-        };
         format!(
             r#"<meta http-equiv="refresh" content="3;url=/oauth/resume?request_id={request_id}">
-{intro}
+<h1>Sign in to {brand}</h1><p>Use the existing Docmost login screen. This page will continue once you have signed in.</p>
 <a href="/login" target="_blank" rel="noopener noreferrer">Open Docmost sign in</a>
 <p>After signing in, return to this tab to authorize the connection.</p>"#
         )
@@ -2384,7 +2484,10 @@ mod tests {
             .to_string();
         let page = response.text().await?;
         assert!(page.contains("Sign in to Docmost again"));
-        assert!(page.contains("href=\"/login\""));
+        // Docmost's /login would bounce a signed-in browser, so the page
+        // signs it out first instead of linking straight there.
+        assert!(page.contains("action=\"/oauth/renew\""));
+        assert!(!page.contains("href=\"/login\""));
         assert!(!page.contains("Authorize connection"));
         let request_id = state
             .inner
@@ -2408,6 +2511,59 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
         assert!(refused.text().await?.contains("ends too soon"));
         assert!(state.inner.codes.read().await.is_empty());
+
+        // Renewal needs the request's CSRF token.
+        let forged = client
+            .post(format!("{base}/oauth/renew"))
+            .header(header::COOKIE, format!("{csrf_cookie}; authToken={ending}"))
+            .form(&[("request_id", request_id.as_str()), ("csrf", "wrong")])
+            .send()
+            .await?;
+        assert_eq!(forged.status(), StatusCode::BAD_REQUEST);
+        assert!(forged.headers().get(SET_COOKIE).is_none());
+
+        // Renewing expires Docmost's cookie (same name and path, not Secure
+        // on this http origin) and returns to the waiting page.
+        let renewed = client
+            .post(format!("{base}/oauth/renew"))
+            .header(header::COOKIE, format!("{csrf_cookie}; authToken={ending}"))
+            .form(&form)
+            .send()
+            .await?;
+        assert_eq!(renewed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            renewed.headers()[header::LOCATION],
+            format!("/oauth/resume?request_id={request_id}").as_str()
+        );
+        let cleared: Vec<_> = renewed
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert!(cleared[0].starts_with("authToken=; Path=/; Max-Age=0;"));
+        assert!(!cleared[0].contains("Secure"));
+
+        // Without the cookie, the waiting page links to Docmost's sign-in.
+        let signed_out = client
+            .get(format!("{base}/oauth/resume?request_id={request_id}"))
+            .header(header::COOKIE, &csrf_cookie)
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(signed_out.contains("href=\"/login\""));
+
+        // A session that is already fresh is left alone.
+        let kept = client
+            .post(format!("{base}/oauth/renew"))
+            .header(header::COOKIE, format!("{csrf_cookie}; authToken={fresh}"))
+            .form(&form)
+            .send()
+            .await?;
+        assert_eq!(kept.status(), StatusCode::SEE_OTHER);
+        assert!(kept.headers().get(SET_COOKIE).is_none());
 
         // After signing in again, the waiting page offers consent.
         let fresh_cookie = format!("{csrf_cookie}; authToken={fresh}");
@@ -2456,6 +2612,46 @@ mod tests {
         assert!(usable(classify_session(minimum, session(None))));
         assert!(matches!(
             classify_session(minimum, session(Some(Duration::days(1)))),
+            BrowserSession::EndsTooSoon(_)
+        ));
+    }
+
+    #[test]
+    fn oversized_minimums_are_rejected_at_startup_and_never_panic() {
+        // Parses, but `now + this` is past chrono's last representable date.
+        let oversized = parse_duration("100000000d").expect("within Duration's range");
+        assert!(Utc::now().checked_add_signed(oversized).is_none());
+        let config = |minimum| OAuthConfig {
+            public_url: "https://mcp.example.com".into(),
+            docmost_base_url: "http://docmost:3000".into(),
+            brand: DEFAULT_BRAND.into(),
+            browser_url: Some("https://docs.example.com".into()),
+            min_session_remaining: Some(minimum),
+        };
+        for bad in [
+            oversized,
+            Duration::days(MAX_MIN_SESSION_REMAINING_DAYS) + Duration::seconds(1),
+            Duration::seconds(-1),
+        ] {
+            let error = OAuthState::new(config(bad)).err().expect("rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("DOCMOST_MCP_MIN_SESSION_REMAINING")
+            );
+        }
+        assert!(OAuthState::new(config(Duration::days(MAX_MIN_SESSION_REMAINING_DAYS))).is_ok());
+
+        // Even unvalidated, classifying against it compares durations, so
+        // it reports the session as too short instead of panicking.
+        let session = AuthenticatedSession {
+            base_url: "http://docmost:3000".into(),
+            email: "alice@example.com".into(),
+            token: "token".into(),
+            expires_at: Some((Utc::now() + Duration::days(7)).to_rfc3339()),
+        };
+        assert!(matches!(
+            classify_session(Some(oversized), session),
             BrowserSession::EndsTooSoon(_)
         ));
     }
