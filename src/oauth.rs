@@ -2626,6 +2626,8 @@ mod tests {
             docmost_base_url: "http://docmost:3000".into(),
             brand: DEFAULT_BRAND.into(),
             browser_url: Some("https://docs.example.com".into()),
+            client_id_key_path: None,
+            refresh_token_key_path: None,
             min_session_remaining: Some(minimum),
         };
         for bad in [
