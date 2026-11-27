@@ -621,12 +621,14 @@ async fn authorize(
     };
     bind_native_consent(&state, &request_id, native.usable()).await;
     let html = if state.inner.browser_url.is_some() {
+        // One tab so far: nothing else can finish this request.
         render_native_page(
             &request_id,
             &csrf,
             &native,
             &state.inner.brand,
             client_name.as_deref(),
+            false,
         )
     } else {
         render_login_page(&request_id, &csrf, None, &state.inner.brand)
@@ -1505,6 +1507,10 @@ async fn docmost_session(state: &OAuthState, token: String) -> DocmostSession {
 #[derive(Deserialize)]
 struct ResumeQuery {
     request_id: String,
+    /// `signin` when the login sent the sign-in tab back here (see the login
+    /// link in render_native_page). Absent for the waiting tab's own polls.
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 async fn resume_native_authorization(
@@ -1565,6 +1571,10 @@ async fn resume_native_authorization(
             &session,
             &state.inner.brand,
             client_name.as_deref(),
+            // The waiting tab keeps polling on the consent page, so it learns
+            // when the sign-in tab authorizes. The sign-in tab is where the
+            // user acts, so its form does not reload under them.
+            query.tab.as_deref() != Some("signin"),
         ))
         .into_response(),
     )
@@ -1655,6 +1665,7 @@ fn render_native_page(
     session: &BrowserSession,
     brand: &str,
     client_name: Option<&str>,
+    poll_consent: bool,
 ) -> String {
     let client = display_client_name(client_name);
     let brand = escape_html(brand);
@@ -1666,15 +1677,23 @@ fn render_native_page(
     let login_href = escape_html(&format!(
         "/login?redirect={}",
         urlencoding::encode(&format!(
-            "/oauth/resume?request_id={}",
+            "/oauth/resume?request_id={}&tab=signin",
             urlencoding::encode(request_id)
         ))
     ));
     let request_id = escape_html(request_id);
     let csrf = escape_html(csrf);
     let content = if let BrowserSession::Usable(session) = session {
+        let refresh = if poll_consent {
+            format!(
+                r#"<meta http-equiv="refresh" content="5;url=/oauth/resume?request_id={request_id}">
+"#
+            )
+        } else {
+            String::new()
+        };
         format!(
-            r#"<h1>Connect {brand} to {client}</h1><p>Authorize as <!--email_off-->{}<!--/email_off--> using your existing Docmost session.</p>
+            r#"{refresh}<h1>Connect {brand} to {client}</h1><p>Authorize as <!--email_off-->{}<!--/email_off--> using your existing Docmost session.</p>
 <form method="post" action="/oauth/authorize"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Authorize connection</button></form>
 <p>Your account's space permissions apply. Writes still require explicit confirmation.</p>"#,
             escape_html(&session.email)
@@ -2453,7 +2472,7 @@ mod tests {
             .clone();
         // The sign-in tab is sent back to this request's consent page.
         assert!(wait_html.contains(&format!(
-            "href=\"/login?redirect=%2Foauth%2Fresume%3Frequest_id%3D{request_id}\""
+            "href=\"/login?redirect=%2Foauth%2Fresume%3Frequest_id%3D{request_id}%26tab%3Dsignin\""
         )));
         let csrf = csrf_cookie.split_once('=').unwrap().1;
         let resume = format!("{base}/oauth/resume?request_id={request_id}");
@@ -2521,6 +2540,18 @@ mod tests {
             .text()
             .await?;
         assert!(bob_consent.contains("bob@example.com"));
+        // The waiting tab keeps polling while it shows consent...
+        assert!(bob_consent.contains("http-equiv=\"refresh\""));
+        // ...but the sign-in tab's form stays put.
+        let signin_tab = client
+            .get(format!("{resume}&tab=signin"))
+            .header(header::COOKIE, &bob_cookie)
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(signin_tab.contains("Authorize connection"));
+        assert!(!signin_tab.contains("http-equiv=\"refresh\""));
         let response = client
             .post(format!("{base}/oauth/authorize"))
             .header(
@@ -2581,6 +2612,7 @@ mod tests {
             &BrowserSession::Usable(session),
             "Docmost",
             Some("<script>"),
+            false,
         );
         assert!(!html.contains("<script>"));
         assert!(!html.contains("secret"));

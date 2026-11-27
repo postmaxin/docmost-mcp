@@ -32,7 +32,9 @@ All notable changes are documented here. The format loosely follows
   (and to start again from the client if it did not connect), instead of
   offering a callback link to a client that stopped listening.
   The tab left waiting no longer reports the finished request as "expired or
-  its security check failed"; it says it was authorized in another tab.
+  its security check failed"; it says it was authorized in another tab. The
+  waiting tab keeps polling while it shows the consent form, so it notices;
+  the sign-in tab (marked `tab=signin` in the return path) does not reload.
 - **Protected-resource metadata is also served at its RFC 9728 path.** The
   metadata for the `/mcp` resource belongs at
   `/.well-known/oauth-protected-resource/mcp` (the well-known path plus the
