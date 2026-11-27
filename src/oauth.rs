@@ -173,6 +173,10 @@ struct CompletedAuthorization {
     /// Key of the code in `codes`, so a replay can tell whether the client has
     /// taken it yet.
     code_hash: String,
+    /// The request's CSRF hash. The cookie is cleared once authorized, but the
+    /// form field is still in both tabs' pages (never in a URL), so a replay
+    /// must present it: request_id alone appears in URLs and access logs.
+    csrf_hash: String,
     /// Carried so a refreshed browser replays the same page it saw the first
     /// time, naming the same client.
     client_name: Option<String>,
@@ -674,7 +678,10 @@ async fn complete_authorization(
             .await
             .get(&form.request_id)
             .cloned();
-        if let Some(completed) = completed.filter(|grant| grant.expires_at > Utc::now()) {
+        if let Some(completed) = completed.filter(|grant| {
+            grant.expires_at > Utc::now()
+                && constant_time_equal(&token_hash(&form.csrf), &grant.csrf_hash)
+        }) {
             // Replay the callback link only while the client can still redeem
             // the code. Once it has taken it, its loopback listener is usually
             // gone (even if the exchange then failed), and a
@@ -744,7 +751,7 @@ async fn complete_authorization(
         if pending.consent_session_hash.as_deref() != Some(token_hash(&session.token).as_str()) {
             return oauth_html_error(
                 StatusCode::BAD_REQUEST,
-                "Your Docmost account changed. Return to the authorization page and confirm the current account.",
+                "Your Docmost session changed. Return to the authorization page and confirm it.",
             );
         }
         session
@@ -823,6 +830,7 @@ async fn complete_authorization(
         CompletedAuthorization {
             location: location.clone(),
             code_hash: token_hash(&code),
+            csrf_hash: pending.csrf_hash.clone(),
             client_name: pending.client_name.clone(),
             expires_at,
         },
@@ -1582,9 +1590,9 @@ async fn resume_native_authorization(
             &session,
             &state.inner.brand,
             client_name.as_deref(),
-            // The waiting tab keeps polling on the consent page, so it learns
-            // when the sign-in tab authorizes. The sign-in tab is where the
-            // user acts, so its form does not reload under them.
+            // Only the waiting tab notes that the other tab may have finished.
+            // It does not poll on the consent page: a refresh firing while
+            // the Authorize POST is in flight could drop the callback page.
             query.tab.as_deref() != Some("signin"),
         ))
         .into_response(),
@@ -1676,7 +1684,7 @@ fn render_native_page(
     session: &BrowserSession,
     brand: &str,
     client_name: Option<&str>,
-    poll_consent: bool,
+    waiting_tab: bool,
 ) -> String {
     let client = display_client_name(client_name);
     let brand = escape_html(brand);
@@ -1695,18 +1703,15 @@ fn render_native_page(
     let request_id = escape_html(request_id);
     let csrf = escape_html(csrf);
     let content = if let BrowserSession::Usable(session) = session {
-        let refresh = if poll_consent {
-            format!(
-                r#"<meta http-equiv="refresh" content="5;url=/oauth/resume?request_id={request_id}">
-"#
-            )
+        let other_tab = if waiting_tab {
+            "\n<p>If you already authorized in the sign-in tab, you can close this one.</p>"
         } else {
-            String::new()
+            ""
         };
         format!(
-            r#"{refresh}<h1>Connect {brand} to {client}</h1><p>Authorize as <!--email_off-->{}<!--/email_off--> using your existing Docmost session.</p>
+            r#"<h1>Connect {brand} to {client}</h1><p>Authorize as <!--email_off-->{}<!--/email_off--> using your existing Docmost session.</p>
 <form method="post" action="/oauth/authorize"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="csrf" value="{csrf}"><!--email_off--><input type="hidden" name="email" value="{email}"><!--/email_off--><button type="submit">Authorize connection</button></form>
-<p>Your account's space permissions apply. Writes still require explicit confirmation.</p>"#,
+<p>Your account's space permissions apply. Writes still require explicit confirmation.</p>{other_tab}"#,
             escape_html(&session.email),
             email = escape_html(&session.email)
         )
@@ -2407,7 +2412,7 @@ mod tests {
                 .get(header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
             {
-                Some("Bearer alice-session") => {
+                Some("Bearer alice-session" | "Bearer alice-session-2") => {
                     Json(json!({"data":{"user":{"email":"alice@example.com"}}})).into_response()
                 }
                 Some("Bearer bob-session") => {
@@ -2519,6 +2524,20 @@ mod tests {
             ("csrf", csrf),
             ("email", "alice@example.com"),
         ];
+        // Same account, new session (signed in again elsewhere): the account
+        // check passes, and the session binding refuses until fresh consent.
+        let resigned = client
+            .post(format!("{base}/oauth/authorize"))
+            .header(
+                header::COOKIE,
+                format!("{csrf_cookie}; authToken=alice-session-2"),
+            )
+            .form(&form)
+            .send()
+            .await?;
+        assert_eq!(resigned.status(), StatusCode::BAD_REQUEST);
+        assert!(resigned.text().await?.contains("Docmost session changed"));
+        assert!(state.inner.codes.read().await.is_empty());
         assert_eq!(
             client
                 .post(format!("{base}/oauth/authorize"))
@@ -2558,9 +2577,10 @@ mod tests {
             .text()
             .await?;
         assert!(bob_consent.contains("bob@example.com"));
-        // The waiting tab keeps polling while it shows consent...
-        assert!(bob_consent.contains("http-equiv=\"refresh\""));
-        // ...but the sign-in tab's form stays put.
+        // Neither consent page reloads (a refresh could drop an in-flight
+        // Authorize POST); the waiting tab notes the other tab instead.
+        assert!(!bob_consent.contains("http-equiv=\"refresh\""));
+        assert!(bob_consent.contains("close this one"));
         let signin_tab = client
             .get(format!("{resume}&tab=signin"))
             .header(header::COOKIE, &bob_cookie)
@@ -2570,6 +2590,7 @@ mod tests {
             .await?;
         assert!(signin_tab.contains("Authorize connection"));
         assert!(!signin_tab.contains("http-equiv=\"refresh\""));
+        assert!(!signin_tab.contains("close this one"));
         // The request is now bound to Bob's session (the waiting tab's poll
         // did that), but a form that showed Alice must not grant Bob.
         assert_eq!(
@@ -3152,6 +3173,18 @@ mod tests {
             callback_href(&duplicate_html).as_deref(),
             Some(location.as_str())
         );
+        // request_id alone (it appears in URLs and access logs) replays
+        // nothing: the form's CSRF token is required.
+        let guessed = client
+            .post(format!("{base}/oauth/authorize"))
+            .form(&[
+                ("request_id", request_id.clone()),
+                ("csrf", "not-the-token".to_string()),
+            ])
+            .send()
+            .await?;
+        assert_eq!(guessed.status(), StatusCode::BAD_REQUEST);
+        assert!(callback_href(&guessed.text().await?).is_none());
 
         let redirect = Url::parse(&location)?;
         assert!(

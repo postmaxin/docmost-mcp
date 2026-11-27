@@ -32,9 +32,11 @@ All notable changes are documented here. The format loosely follows
   (and to start again from the client if it did not connect), instead of
   offering a callback link to a client that stopped listening.
   The tab left waiting no longer reports the finished request as "expired or
-  its security check failed"; it says it was authorized in another tab. The
-  waiting tab keeps polling while it shows the consent form, so it notices;
-  the sign-in tab (marked `tab=signin` in the return path) does not reload.
+  its security check failed"; it says it was authorized in another tab. Its
+  consent form notes that it can be closed if the sign-in tab (marked
+  `tab=signin` in the return path) already authorized. A repeat submission
+  replays the callback link only with the form's CSRF token, not with
+  `request_id` alone.
   Each consent form now names the account it showed, and authorizing refuses
   it if the browser has since switched to another Docmost account.
 - **Protected-resource metadata is also served at its RFC 9728 path.** The
