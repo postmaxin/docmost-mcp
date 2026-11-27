@@ -852,6 +852,27 @@ small{{display:block;margin-top:16px;color:#697482;line-height:1.45}}
     response
 }
 
+/// For a waiting tab whose request was authorized from the other tab.
+fn authorized_elsewhere_response(brand: &str, client_name: Option<&str>) -> Response {
+    let brand = escape_html(brand);
+    let client = display_client_name(client_name);
+    hardened_auth_response(
+        Html(format!(
+            r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{brand} authorized</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#f5f6f8;margin:0;display:grid;place-items:center;min-height:100vh;color:#17202a}}
+main{{width:min(420px,calc(100% - 40px));background:white;padding:32px;border-radius:14px;box-shadow:0 10px 30px #0002}}
+h1{{font-size:1.35rem;margin:0 0 8px}}p{{color:#59636e;line-height:1.5}}
+</style></head><body><main><h1>Authorized in another tab</h1>
+<p>You authorized {client} in another tab, so you can close this one. If {client} did not connect, start the connection again from {client}.</p>
+</main></body></html>"#
+        ))
+        .into_response(),
+    )
+}
+
 /// For a consent form submitted after its authorization finished and the
 /// client took the code, typically from the other of two tabs. Taking the code
 /// does not prove the token exchange succeeded, so the page claims only that
@@ -1507,6 +1528,24 @@ async fn resume_native_authorization(
         .await
         .get(&query.request_id)
         .cloned();
+    if pending.is_none() {
+        // The other tab (sign-in tab or waiting tab) already authorized this
+        // request. Say so, without the callback link: this tab may not hold
+        // the CSRF cookie, and authorizing does not prove the client connected.
+        let completed = state
+            .inner
+            .completed
+            .read()
+            .await
+            .get(&query.request_id)
+            .cloned();
+        if let Some(completed) = completed.filter(|grant| grant.expires_at > Utc::now()) {
+            return authorized_elsewhere_response(
+                &state.inner.brand,
+                completed.client_name.as_deref(),
+            );
+        }
+    }
     let csrf = cookie_value(&headers, "mcp_auth_csrf").unwrap_or_default();
     let client_name = pending.as_ref().and_then(|p| p.client_name.clone());
     if !pending.is_some_and(|p| {
@@ -2498,6 +2537,15 @@ mod tests {
         assert_eq!(grant.session.email, "bob@example.com");
         assert_eq!(grant.code_challenge, pkce_challenge(&verifier));
         drop(grants);
+
+        // The other tab's next poll finds the request authorized, not failed,
+        // and gets no callback link.
+        let other_tab = client.get(&resume).send().await?;
+        assert_eq!(other_tab.status(), StatusCode::OK);
+        let other_tab = other_tab.text().await?;
+        assert!(other_tab.contains("Authorized in another tab"));
+        assert!(!other_tab.contains("continue-to-client"));
+        assert!(!other_tab.contains("security check failed"));
         mock.abort();
         server.abort();
         Ok(())
