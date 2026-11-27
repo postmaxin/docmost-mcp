@@ -27,6 +27,9 @@ All notable changes are documented here. The format loosely follows
   `SameSite=Lax`, because browsers withhold `Strict` cookies on that redirect,
   which arrives from the identity provider. Cross-site POSTs still never carry
   it, and the pages still cannot be framed.
+  Both tabs can now reach the consent page. After the client has redeemed the
+  code from one, submitting the other says the connection is already made,
+  instead of offering a callback link to a client that stopped listening.
 - **Protected-resource metadata is also served at its RFC 9728 path.** The
   metadata for the `/mcp` resource belongs at
   `/.well-known/oauth-protected-resource/mcp` (the well-known path plus the

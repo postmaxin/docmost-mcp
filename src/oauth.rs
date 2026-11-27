@@ -170,6 +170,9 @@ struct PendingAuthorization {
 #[derive(Clone)]
 struct CompletedAuthorization {
     location: String,
+    /// Key of the code in `codes`, so a replay can tell whether the client has
+    /// redeemed it yet.
+    code_hash: String,
     /// Carried so a refreshed browser replays the same page it saw the first
     /// time, naming the same client.
     client_name: Option<String>,
@@ -670,8 +673,24 @@ async fn complete_authorization(
             .get(&form.request_id)
             .cloned();
         if let Some(completed) = completed.filter(|grant| grant.expires_at > Utc::now()) {
-            return authorization_response(
-                &completed.location,
+            // Replay the callback link only while the client can still redeem
+            // it. Once it has, its loopback listener is usually gone, and a
+            // second tab (the sign-in tab and the waiting tab both reach the
+            // consent page) would lead the user to a dead link.
+            if state
+                .inner
+                .codes
+                .read()
+                .await
+                .contains_key(&completed.code_hash)
+            {
+                return authorization_response(
+                    &completed.location,
+                    &state.inner.brand,
+                    completed.client_name.as_deref(),
+                );
+            }
+            return already_connected_response(
                 &state.inner.brand,
                 completed.client_name.as_deref(),
             );
@@ -792,6 +811,7 @@ async fn complete_authorization(
         form.request_id.clone(),
         CompletedAuthorization {
             location: location.clone(),
+            code_hash: token_hash(&code),
             client_name: pending.client_name.clone(),
             expires_at,
         },
@@ -827,6 +847,28 @@ small{{display:block;margin-top:16px;color:#697482;line-height:1.45}}
 <p>Your {brand} account was accepted. Continue to {client} to finish connecting the MCP.</p>
 <a id="continue-to-client" href="{escaped_location}">Continue to {client}</a>
 <small>Use the Continue button to return to your MCP client and finish connecting.</small>
+</main></body></html>"#
+    );
+    let mut response = hardened_auth_response(Html(html).into_response());
+    clear_csrf_cookie(&mut response);
+    response
+}
+
+/// For a consent form submitted after its authorization finished and the
+/// client redeemed the code, typically from the other of two tabs.
+fn already_connected_response(brand: &str, client_name: Option<&str>) -> Response {
+    let brand = escape_html(brand);
+    let client = display_client_name(client_name);
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{brand} connected</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#f5f6f8;margin:0;display:grid;place-items:center;min-height:100vh;color:#17202a}}
+main{{width:min(420px,calc(100% - 40px));background:white;padding:32px;border-radius:14px;box-shadow:0 10px 30px #0002}}
+h1{{font-size:1.35rem;margin:0 0 8px}}p{{color:#59636e;line-height:1.5}}
+</style></head><body><main><h1>{brand} is already connected</h1>
+<p>{client} finished connecting from another tab. You can close this tab.</p>
 </main></body></html>"#
     );
     let mut response = hardened_auth_response(Html(html).into_response());
@@ -3000,7 +3042,7 @@ mod tests {
             .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
             .expect("authorization code");
 
-        Ok(client
+        let tokens: TestTokenResponse = client
             .post(format!("{base}/oauth/token"))
             .form(&[
                 ("grant_type", "authorization_code"),
@@ -3014,7 +3056,20 @@ mod tests {
             .await?
             .error_for_status()?
             .json()
-            .await?)
+            .await?;
+
+        // Once the code is redeemed, a late submission (the other tab's
+        // consent form) gets no dead callback link.
+        let late = client
+            .post(format!("{base}/oauth/authorize"))
+            .form(&login_form)
+            .send()
+            .await?;
+        assert_eq!(late.status(), StatusCode::OK);
+        let late_html = late.text().await?;
+        assert!(callback_href(&late_html).is_none());
+        assert!(late_html.contains("already connected"));
+        Ok(tokens)
     }
 
     fn hidden_value(html: &str, name: &str) -> Option<String> {
