@@ -35,6 +35,8 @@ All notable changes are documented here. The format loosely follows
   its security check failed"; it says it was authorized in another tab. The
   waiting tab keeps polling while it shows the consent form, so it notices;
   the sign-in tab (marked `tab=signin` in the return path) does not reload.
+  Each consent form now names the account it showed, and authorizing refuses
+  it if the browser has since switched to another Docmost account.
 - **Protected-resource metadata is also served at its RFC 9728 path.** The
   metadata for the `/mcp` resource belongs at
   `/.well-known/oauth-protected-resource/mcp` (the well-known path plus the

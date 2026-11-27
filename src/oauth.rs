@@ -730,6 +730,17 @@ async fn complete_authorization(
                 );
             }
         };
+        // The form names the account it showed. Every render rebinds the
+        // request to the browser's current session (and the waiting tab
+        // re-renders as it polls), so without this a form showing one account
+        // could be submitted after the browser switched to another.
+        let shown = form.email.trim();
+        if shown.is_empty() || !shown.eq_ignore_ascii_case(session.email.trim()) {
+            return oauth_html_error(
+                StatusCode::BAD_REQUEST,
+                "Your Docmost account changed. Return to the authorization page and confirm the current account.",
+            );
+        }
         if pending.consent_session_hash.as_deref() != Some(token_hash(&session.token).as_str()) {
             return oauth_html_error(
                 StatusCode::BAD_REQUEST,
@@ -1694,9 +1705,10 @@ fn render_native_page(
         };
         format!(
             r#"{refresh}<h1>Connect {brand} to {client}</h1><p>Authorize as <!--email_off-->{}<!--/email_off--> using your existing Docmost session.</p>
-<form method="post" action="/oauth/authorize"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Authorize connection</button></form>
+<form method="post" action="/oauth/authorize"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="csrf" value="{csrf}"><!--email_off--><input type="hidden" name="email" value="{email}"><!--/email_off--><button type="submit">Authorize connection</button></form>
 <p>Your account's space permissions apply. Writes still require explicit confirmation.</p>"#,
-            escape_html(&session.email)
+            escape_html(&session.email),
+            email = escape_html(&session.email)
         )
     } else if let BrowserSession::EndsTooSoon(expiry) = session {
         // Docmost's /login forwards a signed-in browser to the app, so the
@@ -2500,7 +2512,13 @@ mod tests {
         assert!(consent.contains("Native test"));
         assert!(!consent.contains("name=\"password\""));
         assert!(state.inner.codes.read().await.is_empty());
-        let form = [("request_id", request_id.as_str()), ("csrf", csrf)];
+        // The form carries the account its page showed.
+        assert!(consent.contains("name=\"email\" value=\"alice@example.com\""));
+        let form = [
+            ("request_id", request_id.as_str()),
+            ("csrf", csrf),
+            ("email", "alice@example.com"),
+        ];
         assert_eq!(
             client
                 .post(format!("{base}/oauth/authorize"))
@@ -2552,6 +2570,24 @@ mod tests {
             .await?;
         assert!(signin_tab.contains("Authorize connection"));
         assert!(!signin_tab.contains("http-equiv=\"refresh\""));
+        // The request is now bound to Bob's session (the waiting tab's poll
+        // did that), but a form that showed Alice must not grant Bob.
+        assert_eq!(
+            client
+                .post(format!("{base}/oauth/authorize"))
+                .header(header::COOKIE, &bob_cookie)
+                .form(&form)
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.inner.codes.read().await.is_empty());
+        let form = [
+            ("request_id", request_id.as_str()),
+            ("csrf", csrf),
+            ("email", "bob@example.com"),
+        ];
         let response = client
             .post(format!("{base}/oauth/authorize"))
             .header(
@@ -2813,10 +2849,16 @@ mod tests {
             .text()
             .await?;
         assert!(consent.contains("Authorize connection"));
+        // Submit what the page rendered, including the account it showed.
+        let shown = hidden_value(&consent, "email").expect("consent form names its account");
         let granted = client
             .post(format!("{base}/oauth/authorize"))
             .header(header::COOKIE, &fresh_cookie)
-            .form(&form)
+            .form(&[
+                ("request_id", hidden_value(&consent, "request_id").unwrap()),
+                ("csrf", hidden_value(&consent, "csrf").unwrap()),
+                ("email", shown),
+            ])
             .send()
             .await?;
         assert_eq!(granted.status(), StatusCode::OK);
