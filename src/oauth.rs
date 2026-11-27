@@ -628,9 +628,13 @@ async fn authorize(
     } else {
         render_login_page(&request_id, &csrf, None, &state.inner.brand)
     };
-    let cookie = format!(
-        "mcp_auth_csrf={csrf}; Path=/oauth; Max-Age=600; HttpOnly; Secure; SameSite=Strict"
-    );
+    // Lax, not Strict: after sign-in the login (an SSO round trip through the
+    // identity provider) redirects the sign-in tab to /oauth/resume, and
+    // browsers withhold Strict cookies on a redirect chain with a cross-site
+    // hop. Lax is still withheld from cross-site POSTs, so the consent and
+    // renew forms keep their CSRF protection, and the pages cannot be framed.
+    let cookie =
+        format!("mcp_auth_csrf={csrf}; Path=/oauth; Max-Age=600; HttpOnly; Secure; SameSite=Lax");
     let mut response = hardened_auth_response(Html(html).into_response());
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -834,7 +838,7 @@ fn clear_csrf_cookie(response: &mut Response) {
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_static(
-            "mcp_auth_csrf=; Path=/oauth; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+            "mcp_auth_csrf=; Path=/oauth; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
         ),
     );
 }
@@ -2348,12 +2352,10 @@ mod tests {
             ])
             .send()
             .await?;
-        let csrf_cookie = response.headers()[SET_COOKIE]
-            .to_str()?
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string();
+        let set_cookie = response.headers()[SET_COOKIE].to_str()?.to_string();
+        // Lax, so it survives the sign-in tab's redirect back from the IdP.
+        assert!(set_cookie.contains("SameSite=Lax"));
+        let csrf_cookie = set_cookie.split(';').next().unwrap().to_string();
         let wait_html = response.text().await?;
         assert!(wait_html.contains("href=\"/login?redirect="));
         assert!(!wait_html.contains("name=\"password\""));

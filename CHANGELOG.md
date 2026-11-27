@@ -22,7 +22,11 @@ All notable changes are documented here. The format loosely follows
   home page. The consent prompt had appeared in the original tab, out of
   sight, so the sign-in looked like it had failed. The link now passes
   `redirect=/oauth/resume?request_id=…`, so a login that honours `redirect`
-  (docmost-sso does) returns that tab to the consent page. The original tab still continues on its own.
+  (docmost-sso does) returns that tab to the consent page. The original tab
+  still continues on its own. The `mcp_auth_csrf` cookie is now
+  `SameSite=Lax`, because browsers withhold `Strict` cookies on that redirect,
+  which arrives from the identity provider. Cross-site POSTs still never carry
+  it, and the pages still cannot be framed.
 - **Protected-resource metadata is also served at its RFC 9728 path.** The
   metadata for the `/mcp` resource belongs at
   `/.well-known/oauth-protected-resource/mcp` (the well-known path plus the
