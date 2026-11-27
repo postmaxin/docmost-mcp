@@ -17,6 +17,12 @@ All notable changes are documented here. The format loosely follows
   two different products. **Breaking** for anyone who pinned the old names.
 
 ### Fixed
+- **Browser sign-in now ends on the consent page.** With browser login, "Open
+  Docmost sign in" opened `/login` in a new tab, which finished on Docmost's
+  home page. The consent prompt had appeared in the original tab, out of
+  sight, so the sign-in looked like it had failed. The link now passes
+  `redirect=/oauth/resume?request_id=…`, so a login that honours `redirect`
+  (docmost-sso does) returns that tab to the consent page. The original tab still continues on its own.
 - **Protected-resource metadata is also served at its RFC 9728 path.** The
   metadata for the `/mcp` resource belongs at
   `/.well-known/oauth-protected-resource/mcp` (the well-known path plus the

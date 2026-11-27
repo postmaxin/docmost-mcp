@@ -1573,6 +1573,18 @@ fn render_native_page(
 ) -> String {
     let client = display_client_name(client_name);
     let brand = escape_html(brand);
+    // Docmost's login (and docmost-sso) send the browser to `redirect` once it
+    // has signed in, so the sign-in tab lands on this request's consent page
+    // instead of Docmost's home page, where the waiting tab's prompt goes
+    // unseen. A login that ignores `redirect` still works: this tab keeps
+    // polling either way.
+    let login_href = escape_html(&format!(
+        "/login?redirect={}",
+        urlencoding::encode(&format!(
+            "/oauth/resume?request_id={}",
+            urlencoding::encode(request_id)
+        ))
+    ));
     let request_id = escape_html(request_id);
     let csrf = escape_html(csrf);
     let content = if let BrowserSession::Usable(session) = session {
@@ -1601,8 +1613,8 @@ fn render_native_page(
         format!(
             r#"<meta http-equiv="refresh" content="3;url=/oauth/resume?request_id={request_id}">
 <h1>Sign in to {brand}</h1><p>Use the existing Docmost login screen. This page will continue once you have signed in.</p>
-<a href="/login" target="_blank" rel="noopener noreferrer">Open Docmost sign in</a>
-<p>After signing in, return to this tab to authorize the connection.</p>"#
+<a href="{login_href}" target="_blank" rel="noopener noreferrer">Open Docmost sign in</a>
+<p>After signing in, authorize the connection in the tab that opens, or here.</p>"#
         )
     };
     format!(
@@ -2343,7 +2355,7 @@ mod tests {
             .unwrap()
             .to_string();
         let wait_html = response.text().await?;
-        assert!(wait_html.contains("href=\"/login\""));
+        assert!(wait_html.contains("href=\"/login?redirect="));
         assert!(!wait_html.contains("name=\"password\""));
         assert!(!wait_html.contains("PREP"));
         assert!(state.inner.codes.read().await.is_empty());
@@ -2356,6 +2368,10 @@ mod tests {
             .next()
             .unwrap()
             .clone();
+        // The sign-in tab is sent back to this request's consent page.
+        assert!(wait_html.contains(&format!(
+            "href=\"/login?redirect=%2Foauth%2Fresume%3Frequest_id%3D{request_id}\""
+        )));
         let csrf = csrf_cookie.split_once('=').unwrap().1;
         let resume = format!("{base}/oauth/resume?request_id={request_id}");
         assert_eq!(
@@ -2651,7 +2667,7 @@ mod tests {
             .await?
             .text()
             .await?;
-        assert!(signed_out.contains("href=\"/login\""));
+        assert!(signed_out.contains("href=\"/login?redirect="));
 
         // A session that is already fresh is left alone.
         let kept = client
