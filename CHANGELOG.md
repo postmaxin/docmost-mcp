@@ -34,7 +34,11 @@ All notable changes are documented here. The format loosely follows
   The tab left waiting no longer reports the finished request as "expired or
   its security check failed"; it says it was authorized in another tab. Its
   consent form notes that it can be closed if the sign-in tab (marked
-  `tab=signin` in the return path) already authorized. A repeat submission
+  `tab=signin` in the return path) already authorized, and a small script
+  (allowed by its hash in the CSP) checks `/oauth/resume?status=1` every few
+  seconds and replaces the form with that message once the other tab has
+  authorized. It never reloads the page, so it cannot drop an Authorize click
+  in that tab. A repeat submission
   replays the callback link only with the form's CSRF token, not with
   `request_id` alone.
   Each consent form now names the account it showed, and authorizing refuses
